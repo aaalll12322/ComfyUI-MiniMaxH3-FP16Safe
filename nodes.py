@@ -237,7 +237,8 @@ def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
 # ---- DiT block / refiner block: fp32 residual stream, fp16 inner compute ----
 import os as _os
 import time as _time
-_PROFILE = _os.environ.get("MINIMAXH3_PROFILE", "").strip().lower() in ("1", "true", "yes", "on")
+_ENV_PROFILE = _os.environ.get("MINIMAXH3_PROFILE", "").strip().lower() in ("1", "true", "yes", "on")
+_PROFILE = _ENV_PROFILE          # 进程内当前开关状态, 每次 patch 重新按 env/节点开关决定
 _prof = {"attn": 0.0, "mlp": 0.0, "other": 0.0, "n": 0}
 
 
@@ -479,8 +480,10 @@ class MiniMaxH3FP16Safe:
             print("[MiniMaxH3-FP16Safe] WARNING: set_model_compute_dtype(fp16) failed: %s" % e)
 
         # ---- DiT (UNet) ----
-        global _PROFILE
-        _PROFILE = _PROFILE or bool(profile)
+        global _PROFILE, _prof
+        # 节点开关可真正关闭; 只有环境变量显式开启时 profile 才强制打开
+        _PROFILE = _ENV_PROFILE or bool(profile)
+        _prof = {"attn": 0.0, "mlp": 0.0, "other": 0.0, "n": 0}   # 每次 patch 重置累计, 避免跨多次运行叠加
         inner = getattr(model, "model", None)
         if _is_minimax_dit(inner):
             mm_model.Attention.forward = _dit_attn_forward
@@ -557,12 +560,9 @@ class MiniMaxH3FP16Safe:
         print("[MiniMaxH3-FP16Safe] debug_nan enabled.")
 
 
-# 官方 ID 与旧版兼容别名 (v2 时代保存的工作流无需改动)
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3FP16Safe": MiniMaxH3FP16Safe,
-    "MiniMaxH3FP16SafeV2": MiniMaxH3FP16Safe,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3FP16Safe": "MiniMax H3 FP16 Safe",
-    "MiniMaxH3FP16SafeV2": "MiniMax H3 FP16 Safe",
 }

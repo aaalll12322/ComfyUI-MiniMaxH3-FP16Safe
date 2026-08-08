@@ -26,7 +26,7 @@ git clone https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
 
 重启 ComfyUI。工作流中在 `MiniMaxH3` 分类下找到 **"MiniMax H3 FP16 Safe"** 节点。
 
-> 若已安装过旧版 `ComfyUI-MiniMaxH3-FP16Fix-v2`：删除旧文件夹，本插件节点 ID 与旧版兼容，已保存的工作流无需改动。
+> 若已安装过旧版 `ComfyUI-MiniMaxH3-FP16Fix-v2`：删除旧文件夹；旧工作流中若使用了旧节点 ID `MiniMaxH3FP16SafeV2`，请重新选择本插件节点后再保存。
 
 ---
 

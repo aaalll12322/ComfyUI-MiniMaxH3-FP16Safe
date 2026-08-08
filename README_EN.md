@@ -26,7 +26,7 @@ git clone https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
 
 Restart ComfyUI. Find the **"MiniMax H3 FP16 Safe"** node under the `MiniMaxH3` category.
 
-> If you previously installed the older `ComfyUI-MiniMaxH3-FP16Fix-v2`: delete the old folder. This plugin keeps the old node IDs for compatibility, so saved workflows keep working unchanged.
+> If you previously installed the older `ComfyUI-MiniMaxH3-FP16Fix-v2`: delete the old folder. Workflows saved with the old node ID `MiniMaxH3FP16SafeV2` must re-select this plugin's node before saving.
 
 ---
 
