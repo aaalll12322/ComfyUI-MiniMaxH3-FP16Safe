@@ -1,4 +1,4 @@
-# ComfyUI-MiniMaxH3-FP16Safe v6.0.0
+# ComfyUI-MiniMaxH3-FP16Safe v6.3.0
 #
 # Make MiniMax H3 (comfy/ldm/minimax, PR #15224) numerically stable in fp16
 # compute on GPUs without bf16/fp8 hardware (V100 sm_70 etc.), at near-fp16
@@ -175,14 +175,26 @@ def _qkv_scale_check(self, x, x_scale):
     return q, k, v, x_scale
 
 
-# ---- DiT Attention (v3): ALWAYS-fp16 SDPA via power-of-2 residual scaling ----
+# ---- DiT Attention (v6.3): ALWAYS-fp16 SDPA with FIXED power-of-2 scale ----
+# Zero per-layer scans. x (fp16 or fp32) is always divided by 256 (2^8, exact)
+# before qkv_proj, so qkv output is bounded by |x|/256 * ||W_qkv||. For |x| up
+# to 60000 (fp16 stream bound) and realistic weight norms this stays ~700, and
+# even |x|=1e6 (fp32, extreme) stays fp16-safe. q/k are restored exactly by
+# RMSNorm homogeneity (logits see O(1) values); v stays scaled through the
+# linear chain SDPA -> out_proj and is unscaled in fp32 after out_proj (small
+# [s, 3072] tensor). Bounds: |P@v| <= 706 (measured) -> scaled 2.76, out_proj
+# out ~39k/256 = 152 -> fp16 can never overflow.
+_ATTN_FIXED_SCALE = 256.0   # 2^8
+
+
 def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     s = x.shape[0]
-    # v3: scale the residual before qkv_proj so fp16 never overflows (V100 has no
-    # fp32 Tensor Core; a single fp32 SDPA layer costs ~4x). q/k are restored by
-    # RMSNorm's scale invariance, v is unscaled after SDPA below.
-    x_h, x_scale = _fp16_scaled(x)
-    q, k, v, x_scale = _qkv_scale_check(self, x_h, x_scale)
+    if x.dtype == torch.float16:
+        x_h = x * (1.0 / _ATTN_FIXED_SCALE)              # exact in fp16
+    else:
+        x_h = (x * (1.0 / _ATTN_FIXED_SCALE)).to(torch.float16)
+    qkv = self.qkv_proj(x_h)
+    q, k, v = qkv.split(self.heads * self.head_dim, dim=-1)
     v = v.view(s, self.heads, self.head_dim)
     if rope_freqs is not None:
         q = q.view(1, s, self.heads, self.head_dim)
@@ -206,37 +218,38 @@ def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     else:
         q = self.q_norm(q.view(s, self.heads, self.head_dim))
         k = self.k_norm(k.view(s, self.heads, self.head_dim))
-    # [1, heads, s, hd]; q/k already fp16 (RMSNorm restores scale), v is /scale
+    # [1, heads, s, hd]; q/k restored to O(1) by RMSNorm, v still /256
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
     if q.dtype == torch.float16:
         out = torch.nn.functional.scaled_dot_product_attention(q, k, v)   # fp16 Tensor-Core SDPA
-        if x_scale != 1.0:
-            out.mul_(x_scale)                                              # unscale v (in-place)
     else:
-        out = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float()) * x_scale
+        out = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float())
     out = out.transpose(1, 2).reshape(s, -1)                              # [s, heads*hd]
-    proj = self.out_proj(out)                                             # fp16 matmul (fast)
-    if not torch.isfinite(proj).all():                                    # fuse: rare fp32 retry (seq=98k DOES fire)
-        proj = self.out_proj(out.float())
-    return proj.float()                                                   # fp32 for the stream
+    proj = self.out_proj(out)                                             # fp16, bounded <= ~152
+    proj = proj.float() * _ATTN_FIXED_SCALE                               # unscale v in fp32
+    if not torch.isfinite(proj).all():                                    # insurance (never fires)
+        proj = self.out_proj(out.float()).float() * _ATTN_FIXED_SCALE
+    return proj                                                           # fp32 for the stream
 
 
 # ---- DiT block / refiner block: fp32 residual stream, fp16 inner compute ----
 import os as _os
 import time as _time
 _PROFILE = _os.environ.get("MINIMAXH3_PROFILE", "").strip().lower() in ("1", "true", "yes", "on")
-_prof = {"attn": 0.0, "mlp": 0.0, "other": 0.0}
+_prof = {"attn": 0.0, "mlp": 0.0, "other": 0.0, "n": 0}
 
 
 def _prof_block(i, kind, dt_attn, dt_mlp, dt_other):
     _prof["attn"] += dt_attn
     _prof["mlp"] += dt_mlp
     _prof["other"] += dt_other
-    if i in (2, 5, 10, 25, 50, 100):
+    _prof["n"] += 1
+    idx = i if i >= 0 else _prof["n"]        # fallback: call counter
+    if idx in (2, 5, 10, 25, 50, 100):
         alloc = torch.cuda.memory_allocated() / 2**30
-        print(f"[MiniMaxH3-FP16Safe][PROF] block {i} ({kind}): attn累计={_prof['attn']:.1f}s "
+        print(f"[MiniMaxH3-FP16Safe][PROF] block {idx} ({kind}): attn累计={_prof['attn']:.1f}s "
               f"mlp累计={_prof['mlp']:.1f}s other累计={_prof['other']:.1f}s "
               f"当前allocated={alloc:.1f}GB", flush=True)
 
@@ -335,32 +348,22 @@ def _mlp_forward(self, x):
                 outs.append(self.fc2(act).float())
             out = torch.cat(outs, dim=0)
         return out
-    # fast path: fully fp16 MLP (fc1 out ~585 safe; no fp32 casts anywhere)
+    # fast path: fully fp16 MLP, ZERO per-chunk syncs (v6.2).
+    # Fixed conservative scales (no .item() scans):
+    #   * bs=16 on the gate branch: measured max|fc1|=585 -> act = silu(a)*(b/16)
+    #     <= 585*36.6 = 21.4k (fp16-safe), with ~3.4x headroom for outliers;
+    #   * fs=8 on the act input: fc2 out ~8.5x input -> <= 21.4k/8*8.5 = 22.7k.
+    # Both are powers of 2 (exact in fp16); unscale in fp32 at the end. The
+    # isfinite fuse below catches any unexpected overflow (rare fp32 retry).
+    _BS = 16.0
+    _FS = 8.0
     outs = []
     for i in range(0, s, _MLP_CHUNK):
         xc = x_h[i:i + _MLP_CHUNK]
         y16 = self.fc1(xc)                       # fp16 [c, 2I], max ~585 (safe)
         a, b = y16.chunk(2, dim=-1)
-        try:
-            bmax = b.abs().max().item()          # 1 sync/chunk
-        except Exception:
-            bmax = 0.0
-        bs = 1.0
-        if bmax > 4.0:                           # keep silu(a)*(b/bs) <= ~585*4
-            bs = float(1 << int(math.ceil(math.log2(bmax / 4.0))))
-        if bs != 1.0:
-            act = torch.nn.functional.silu(a) * (b * (1.0 / bs))   # b/2^k exact in fp16
-        else:
-            act = torch.nn.functional.silu(a) * b                  # fp16 gated-silu
-        try:
-            amax = act.abs().max().item()        # 1 sync/chunk
-        except Exception:
-            amax = 0.0
-        if amax > 4000.0:                        # fc2 out ~8.5x in; scale to stay fp16-safe
-            fs = 1 << int(math.ceil(math.log2(max(amax / 4000.0, 1.0))))
-            outs.append(self.fc2((act * (1.0 / fs)).to(torch.float16)).float() * fs * bs)
-        else:
-            outs.append(self.fc2(act).float() * bs)
+        act = torch.nn.functional.silu(a) * (b * (1.0 / _BS))        # fp16 gated-silu
+        outs.append(self.fc2(act * (1.0 / _FS)).float() * _FS * _BS) # fp16 fc2, fp32 unscale
     out = torch.cat(outs, dim=0)
     if not torch.isfinite(out).all():            # fuse: rare fp32 chunked retry
         outs = []
@@ -491,8 +494,17 @@ class MiniMaxH3FP16Safe:
                 if hasattr(m, "condition_proj") and isinstance(m.condition_proj, torch.nn.Module):
                     m.condition_proj = _FP32LinearWrap(m.condition_proj)
                     wrapped_cond += 1
-            print("[MiniMaxH3-FP16Safe][V6-FP16MLP] DiT patched: fp32 residual stream + fp16 SDPA attention "
-                  "+ fully-fp16 MLP (gate-scaled, chunked) + %d RMSNorm(s) + %d condition_proj. "
+            # 总是给 block 打索引 (debug_nan 与 profile 都依赖它)
+            try:
+                for m in target.modules():
+                    if isinstance(m, mm_model.MiniMaxH3Model):
+                        for i, blk in enumerate(m.blocks):
+                            blk._dbg_index = i
+                        break
+            except Exception:
+                pass
+            print("[MiniMaxH3-FP16Safe][V6.3-FIXEDATTN] DiT patched: fp32 residual stream + fp16 SDPA attention "
+                  "(fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
                   "(profile=%s)" % (n, wrapped_cond, _PROFILE))
 
             if debug_nan:

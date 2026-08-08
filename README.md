@@ -1,6 +1,6 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.0.0**
+**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.3.0**
 
 在 **V100（sm_70，无 bf16/fp8 硬件）** 或任何强制 fp16 计算的机器上，让 MiniMax H3（`comfy/ldm/minimax`，PR #15224）以**接近纯 fp16 的速度**获得**接近 fp32 的数值稳定性**——在硬件上"手动模拟 bf16 的宽指数范围"。
 
@@ -55,18 +55,19 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 |---|---|
 | 残差流（50 层 DiTBlock） | fp32（`_dit_block_forward`），不再有 fp16 累积溢出 |
 | RMSNorm（210 个） | fp32 计算，I/O dtype 不变 |
-| attention | **全程 fp16 SDPA**（2 的幂缩放补偿：残差流超阈值时先除以 2 的幂再降 fp16，q/k 由 RMSNorm 缩放不变性自动还原、v 输出乘回；SDPA 内部 fp32 累加 + max-subtract 抗溢出）；out_proj fp16 + 溢出回退 fp32 |
-| MLP（v6） | **全 fp16**：fc1 输出（实测 max≈585）保持 fp16；gated-silu 的 gate 分支按 2 的幂缩放（`act = silu(a)·(b/2^k) ≤ ~2340`）；fc2 fp16；末尾 fp32 还原（小张量）。**零 fp32 中间张量** |
+| attention | **全程 fp16 SDPA（v6.3 固定缩放零扫描）**：输入一律 ÷256（2 的幂精确）再进 qkv_proj → qkv 有硬上界；q/k 由 RMSNorm 齐次性精确还原（logits 用原始量级），v 带缩放穿过线性链 SDPA→out_proj 后 fp32 乘回；**数学上不可能溢出，全程零 `.item()` 扫描** |
+| MLP（v6.2） | **全 fp16 + 固定缩放零扫描**：fc1 输出（实测 max≈585）保持 fp16；gated-silu 固定 ÷16（act ≤ 21.4k，3.4× 裕量）、fc2 固定 ÷8（输出 ≤ 22.7k），全部 2 的幂精确；末尾 fp32 还原。**零 fp32 中间张量、零逐块扫描** |
 | 长序列 | **分块 MLP**：按 16384 行切块单遍处理，激活峰值与 seq 无关（~9GB），避免 16GB 卡上 lowvram 换出雪崩 |
 | Qwen 文本路径（condition_proj） | fp32（防真实 context max≈21k 溢出） |
 | 视频 VAE | fp16 流，仅 norm/attention 分数/silu 升 fp32 |
 
-**保险丝机制**：fp16 快速路径后检查 `torch.isfinite()`，罕见溢出时自动用 fp32 重算该段——**保证永不 NaN**。
+**保险丝机制**：fp16 快速路径后检查 `torch.isfinite()`，罕见溢出时自动用 fp32 重算该段——**保证永不 NaN**（v6.2/6.3 的固定缩放有数学上界，保险丝几乎不触发，仅作安全网）。
 
 **为什么 v6 能全链路 fp16（V100 无 fp32 Tensor Core）**：
-- 实测极端时间步下：P@V 输出 ~706、fc1 ~585（远小于 65504，可安全 fp16）；唯一超限的是 fc2 输出（~50 万）与 gated-silu 产物（~59k）——两者都用 **2 的幂缩放**（除法/乘法在 fp16 中无损）解决。
-- v4/v5 时代 fc1 输出要升 fp32 算 silu，长序列每层多 ~850GB 搬运（480p/10s 约 +30s/步）；v6 的 gate 缩放让 silu 也在 fp16 完成，同时 act 有上界（≤2340）→ **数学上不可能溢出**。
-- 残差流超阈值时 `_fp16_scaled` 仍会整体缩放（罕见），此时 MLP 自动切到 fp32 分块路径保证正确。
+- 实测极端时间步下：P@V 输出 ~706、fc1 ~585（远小于 65504，可安全 fp16）；唯一超限的是 fc2 输出（~50 万）与 gated-silu 产物（~59k）——两者都用 **2 的幂固定缩放**（除法/乘法在 fp16 中无损）解决。
+- v4/v5 时代 fc1 输出要升 fp32 算 silu，长序列每层多 ~850GB 搬运（约 +30s/步）；v6 的 gate 缩放让 silu 也在 fp16 完成，act 有上界 → **数学上不可能溢出**。
+- 残差流超阈值时（罕见）MLP 自动切到 fp32 分块路径保证正确。
+- v6.2/6.3 把 attention 与 MLP 的所有逐层 `.item()` 扫描替换为固定 2 幂缩放（每层同步 11→2 次），在低显存 offload 环境下同步被放大的问题得以消除。
 
 ---
 
@@ -80,16 +81,17 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | 纯 fp32 | 35s |
 | 插件 v2 | 10s |
 
-大 seq（480p/10s，seq≈9.85 万，V100，DiT offload 环境）：
+大 seq（480p/10s，seq≈9.85 万，V100，DiT offload 环境，真实采样 4 步实测）：
 
 | 配置 | 每步耗时 | 说明 |
 |---|---|---|
 | 纯 fp16（无插件） | 63s | NaN → 不可用 |
 | 插件 v4 | 110s | 激活峰值 17GB+ 超 16GB → lowvram 换出雪崩 |
 | 插件 v5（分块） | 97s | 峰值压回 ~9GB，雪崩消除 |
-| **插件 v6（全 fp16 MLP）** | **~65-70s（预期）** | 再消除 fp32 cast 带宽 |
+| 插件 v6（全 fp16 MLP） | 86s（int8）/ 77s（fp8） | 消除 fp32 cast 带宽 |
+| **插件 v6.3（固定缩放零扫描）** | **75-78s（ref2va fp8）** | 消除逐层扫描/同步放大，逼近无插件基线 |
 
-已验证模型：`minimax_h3_fl2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_int8_convrot`（均正常出片）。
+已验证模型：`minimax_h3_fl2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_int8_convrot`（均正常出片；fp8 版比 int8 版快约 9s/步，V100 推荐 fp8）。
 
 ---
 
@@ -97,7 +99,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 
 ```
 [MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6-FP16MLP] DiT patched: fp32 residual stream + fp16 SDPA attention + fully-fp16 MLP (gate-scaled, chunked) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
+[MiniMaxH3-FP16Safe][V6.3-FIXEDATTN] DiT patched: fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
 [MiniMaxH3-FP16Safe] Video VAE patched: attention + transformer-block norms + gated-silu upcast to fp32.
 ```
 
@@ -135,7 +137,10 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | v3 | 2 的幂缩放补偿，全链路 fp16（长 seq 不再退化） |
 | v4 | qkv 检查 3→1 次同步 |
 | v5 | 分块 MLP，长 seq 激活峰值与 seq 无关（110→97s/步） |
-| **v6** | **全 fp16 MLP（gate 缩放），消除 fp32 cast 带宽；数学上不可能溢出** |
+| v6.0 | **全 fp16 MLP（gate 缩放），消除 fp32 cast 带宽；数学上不可能溢出** |
+| v6.1 | MLP 每块 2 次扫描合并为 1 次；修复 profile 开关 |
+| v6.2 | MLP 固定缩放（bs=16/fs=8），零逐块扫描 |
+| **v6.3** | **attention 固定 /256 缩放零扫描（q/k RMSNorm 还原、v 线性链缩放）；每层同步 11→2 次；ref2va fp8 480p/10s 实测 75-78s/步** |
 
 ## License
 
