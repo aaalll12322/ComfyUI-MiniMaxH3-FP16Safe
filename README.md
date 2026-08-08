@@ -18,7 +18,7 @@ MiniMax H3 官方 `supported_inference_dtypes = [bf16, fp32]`，**明确不支�
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/<你的用户名>/ComfyUI-MiniMaxH3-FP16Safe.git
+git clone https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
 # 或手动复制整个文件夹到 ComfyUI/custom_nodes/
 ```
 
