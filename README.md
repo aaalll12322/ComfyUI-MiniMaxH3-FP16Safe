@@ -58,18 +58,18 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | 残差流（50 层 DiTBlock） | fp32（`_dit_block_forward`），不再有 fp16 累积溢出 |
 | RMSNorm（210 个） | fp32 计算，I/O dtype 不变 |
 | attention | **全程 fp16 SDPA（v6.3 固定缩放零扫描）**：输入一律 ÷256（2 的幂精确）再进 qkv_proj → qkv 有硬上界；q/k 由 RMSNorm 齐次性精确还原（logits 用原始量级），v 带缩放穿过线性链 SDPA→out_proj 后 fp32 乘回；**数学上不可能溢出，全程零 `.item()` 扫描** |
-| MLP（v6.2） | **全 fp16 + 固定缩放零扫描**：fc1 输出（实测 max≈585）保持 fp16；gated-silu 固定 ÷16（act ≤ 21.4k，3.4× 裕量）、fc2 固定 ÷8（输出 ≤ 22.7k），全部 2 的幂精确；末尾 fp32 还原。**零 fp32 中间张量、零逐块扫描** |
+| MLP | **全 fp16 + 固定缩放零扫描**：fc1 输出（实测 max≈585）保持 fp16；gated-silu 固定 ÷16（act ≤ 21.4k，3.4× 裕量）、fc2 固定 ÷8（输出 ≤ 22.7k），全部 2 的幂精确；末尾 fp32 还原。**零 fp32 中间张量、零逐块扫描** |
 | 长序列 | **分块 MLP**：按 16384 行切块单遍处理，激活峰值与 seq 无关（~9GB），避免 16GB 卡上 lowvram 换出雪崩 |
 | Qwen 文本路径（condition_proj） | fp32（防真实 context max≈21k 溢出） |
 | 视频 VAE | fp16 流，仅 norm/attention 分数/silu 升 fp32 |
 
-**保险丝机制**：fp16 快速路径后检查 `torch.isfinite()`，罕见溢出时自动用 fp32 重算该段——**保证永不 NaN**（v6.2/6.3 的固定缩放有数学上界，保险丝几乎不触发，仅作安全网）。
+**保险丝机制**：fp16 快速路径后检查 `torch.isfinite()`，罕见溢出时自动用 fp32 重算该段——**保证永不 NaN**（固定缩放的数学上界使保险丝几乎不触发，仅作安全网）。
 
 **为什么 v6 能全链路 fp16（V100 无 fp32 Tensor Core）**：
 - 实测极端时间步下：P@V 输出 ~706、fc1 ~585（远小于 65504，可安全 fp16）；唯一超限的是 fc2 输出（~50 万）与 gated-silu 产物（~59k）——两者都用 **2 的幂固定缩放**（除法/乘法在 fp16 中无损）解决。
-- v4/v5 时代 fc1 输出要升 fp32 算 silu，长序列每层多 ~850GB 搬运（约 +30s/步）；v6 的 gate 缩放让 silu 也在 fp16 完成，act 有上界 → **数学上不可能溢出**。
+- 早期实现 fc1 输出要升 fp32 算 silu，长序列每层多 ~850GB 搬运（约 +30s/步）；当前的 gate 缩放让 silu 也在 fp16 完成，act 有上界 → **数学上不可能溢出**。
 - 残差流超阈值时（罕见）MLP 自动切到 fp32 分块路径保证正确。
-- v6.2/6.3 把 attention 与 MLP 的所有逐层 `.item()` 扫描替换为固定 2 幂缩放（每层同步 11→2 次），在低显存 offload 环境下同步被放大的问题得以消除。
+- 当前版本把 attention 与 MLP 的所有逐层 `.item()` 扫描替换为固定 2 幂缩放（每层同步 11→2 次），在低显存 offload 环境下同步被放大的问题得以消除。
 
 ---
 
@@ -81,17 +81,14 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 |---|---|
 | 纯 fp16（无插件） | 8s（但 NaN → 黑图） |
 | 纯 fp32 | 35s |
-| 插件 v2 | 10s |
+| 插件（fp16 计算） | ~10s |
 
 大 seq（480p/10s，seq≈9.85 万，V100，DiT offload 环境，真实采样 4 步实测）：
 
 | 配置 | 每步耗时 | 说明 |
 |---|---|---|
 | 纯 fp16（无插件） | 63s | NaN → 不可用 |
-| 插件 v4 | 110s | 激活峰值 17GB+ 超 16GB → lowvram 换出雪崩 |
-| 插件 v5（分块） | 97s | 峰值压回 ~9GB，雪崩消除 |
-| 插件 v6（全 fp16 MLP） | 86s（int8）/ 77s（fp8） | 消除 fp32 cast 带宽 |
-| **插件 v6.3（固定缩放零扫描）** | **75-78s（ref2va fp8）** | 消除逐层扫描/同步放大，逼近无插件基线 |
+| **插件 v6.3.0（固定缩放零扫描）** | **75-78s（ref2va fp8）** | fp32 残差流 + fp16 Tensor Core，逼近无插件基线 |
 
 已验证模型：`minimax_h3_fl2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_int8_convrot`（均正常出片；fp8 版比 int8 版快约 9s/步，V100 推荐 fp8）。
 
@@ -117,7 +114,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | 采样仍有 NaN | 打开 `debug_nan`，把 `[MiniMaxH3-FP16Safe][DEBUG]` 输出发来（带 block 索引与输入/输出区分） |
 | 采样正常但解码黑 | 确认 VAE 输入已连到本节点（未连则视频 VAE 无补丁） |
 | 速度慢于预期 | 打开 `profile`，把 `[MiniMaxH3-FP16Safe][PROF]` 输出发来（每阶段耗时定位瓶颈） |
-| VAE 报 dtype 不匹配 | 属旧版 bug，v6 已修复；确认加载的是本插件 |
+| VAE 报 dtype 不匹配 | 属旧版 bug，当前版本已修复；确认加载的是本插件 |
 
 ---
 
@@ -134,15 +131,8 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 
 | 版本 | 要点 |
 |---|---|
-| v1 | 稳定版：attention/MLP 关键段升 fp32 |
-| v2 | 提速：fp16 SDPA + 缩放 fc2（10s/步 @ 352×608） |
-| v3 | 2 的幂缩放补偿，全链路 fp16（长 seq 不再退化） |
-| v4 | qkv 检查 3→1 次同步 |
-| v5 | 分块 MLP，长 seq 激活峰值与 seq 无关（110→97s/步） |
-| v6.0 | **全 fp16 MLP（gate 缩放），消除 fp32 cast 带宽；数学上不可能溢出** |
-| v6.1 | MLP 每块 2 次扫描合并为 1 次；修复 profile 开关 |
-| v6.2 | MLP 固定缩放（bs=16/fs=8），零逐块扫描 |
-| **v6.3** | **attention 固定 /256 缩放零扫描（q/k RMSNorm 还原、v 线性链缩放）；每层同步 11→2 次；ref2va fp8 480p/10s 实测 75-78s/步** |
+| v6.0.0 | 全 fp16 MLP（gate 缩放），消除 fp32 cast 带宽；数学上不可能溢出 |
+| **v6.3.0** | **attention 固定 /256 缩放零扫描（q/k RMSNorm 还原、v 线性链缩放）；每层同步 11→2 次；ref2va fp8 480p/10s 实测 75-78s/步** |
 
 ## License
 

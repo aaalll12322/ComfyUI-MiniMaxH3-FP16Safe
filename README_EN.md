@@ -58,18 +58,18 @@ Idea: **fp32 residual stream (stable accumulation) + fp16 big matmuls (Tensor Co
 | Residual stream (50 DiTBlocks) | fp32 (`_dit_block_forward`), no more fp16 accumulation overflow |
 | RMSNorm (210×) | fp32 compute, I/O dtype preserved |
 | Attention | **Always-fp16 SDPA (v6.3 fixed-scale, zero scans)**: input is always divided by 256 (exact power of 2) before qkv_proj → qkv has a hard upper bound; q/k are restored exactly by RMSNorm homogeneity (logits use the original magnitude), v flows scaled through the linear chain SDPA→out_proj and is unscaled in fp32 afterwards; **mathematically cannot overflow, zero `.item()` scans** |
-| MLP (v6.2) | **Fully fp16 + fixed-scale, zero scans**: fc1 output (measured max ≈585) stays fp16; gated-silu fixed ÷16 (act ≤ 21.4k, 3.4× headroom), fc2 fixed ÷8 (output ≤ 22.7k), all exact powers of 2; fp32 unscale at the end. **Zero fp32 intermediate tensors, zero per-chunk scans** |
+| MLP | **Fully fp16 + fixed-scale, zero scans**: fc1 output (measured max ≈585) stays fp16; gated-silu fixed ÷16 (act ≤ 21.4k, 3.4× headroom), fc2 fixed ÷8 (output ≤ 22.7k), all exact powers of 2; fp32 unscale at the end. **Zero fp32 intermediate tensors, zero per-chunk scans** |
 | Long sequences | **Chunked MLP**: processed in 16384-row chunks in a single pass; activation peak is independent of seq length (~9GB), avoiding lowvram weight-eviction thrash on 16GB cards |
 | Qwen text path (condition_proj) | fp32 (real context max ≈21k would overflow) |
 | Video VAE | fp16 stream; only norms/attention scores/silu upcast to fp32 |
 
-**Fuse mechanism**: the fp16 fast path is followed by a `torch.isfinite()` check; on a rare overflow the segment is recomputed in fp32 — **guaranteed no NaN** (v6.2/6.3 fixed scales have mathematical bounds, so the fuse almost never fires; it is only a safety net).
+**Fuse mechanism**: the fp16 fast path is followed by a `torch.isfinite()` check; on a rare overflow the segment is recomputed in fp32 — **guaranteed no NaN** (the fixed scales have mathematical bounds, so the fuse almost never fires; it is only a safety net).
 
 **Why v6 can go fully fp16 (V100 has no fp32 Tensor Cores)**:
 - Measured at an extreme timestep: P@V output ~706, fc1 ~585 (far below 65504, safely fp16); only fc2 output (~500k) and gated-silu products (~59k) exceed the limit — both are handled with **fixed power-of-2 scaling** (lossless in fp16).
-- v4/v5 upcast the fc1 output to fp32 for silu, costing ~850GB of extra traffic per layer per step on long sequences (+~30s/step); v6's gate scaling does silu in fp16 with a bounded act → **mathematically cannot overflow**.
+- Early implementations upcast the fc1 output to fp32 for silu, costing ~850GB of extra traffic per layer per step on long sequences (+~30s/step); the current gate scaling does silu in fp16 with a bounded act → **mathematically cannot overflow**.
 - When the residual stream exceeds the threshold (rare), the MLP automatically falls back to the chunked-fp32 path for correctness.
-- v6.2/6.3 replaced every per-layer `.item()` scan with fixed power-of-2 scaling (syncs per layer 11→2), eliminating the sync-amplification problem in low-VRAM offload environments.
+- The current version replaced every per-layer `.item()` scan with fixed power-of-2 scaling (syncs per layer 11→2), eliminating the sync-amplification problem in low-VRAM offload environments.
 
 ---
 
@@ -81,17 +81,14 @@ Measured (352×608, 124 frames, 5s video, V100):
 |---|---|
 | Pure fp16 (no plugin) | 8s (but NaN → black frames) |
 | Pure fp32 | 35s |
-| Plugin v2 | 10s |
+| Plugin (fp16 compute) | ~10s |
 
 Long seq (480p/10s, seq ≈ 98.5k, V100, DiT offload environment, real 4-step sampling):
 
 | Config | Time per step | Notes |
 |---|---|---|
 | Pure fp16 (no plugin) | 63s | NaN → unusable |
-| Plugin v4 | 110s | activation peak 17GB+ > 16GB → lowvram eviction thrash |
-| Plugin v5 (chunked) | 97s | peak back to ~9GB, thrash gone |
-| Plugin v6 (fully fp16 MLP) | 86s (int8) / 77s (fp8) | fp32 cast bandwidth eliminated |
-| **Plugin v6.3 (fixed-scale, zero scans)** | **75-78s (ref2va fp8)** | per-layer scans/sync amplification gone, near the no-plugin baseline |
+| **Plugin v6.3.0 (fixed-scale, zero scans)** | **75-78s (ref2va fp8)** | fp32 residual stream + fp16 Tensor Cores, near the no-plugin baseline |
 
 Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_int8_convrot` (all produce valid video; fp8 is ~9s/step faster than int8 on V100 — fp8 recommended).
 
@@ -117,7 +114,7 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 | Sampling still NaN | Enable `debug_nan` and share the `[MiniMaxH3-FP16Safe][DEBUG]` output (block index + input/output distinction) |
 | Sampling fine but decode is black | Make sure the VAE input is connected to this node (otherwise the video VAE is unpatched) |
 | Slower than expected | Enable `profile` and share the `[MiniMaxH3-FP16Safe][PROF]` output (per-stage timings) |
-| VAE dtype mismatch | Old-version bug, fixed in v6; make sure you are loading this plugin |
+| VAE dtype mismatch | Old-version bug, fixed in the current version; make sure you are loading this plugin |
 
 ---
 
@@ -134,15 +131,8 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 
 | Version | Highlights |
 |---|---|
-| v1 | Stable release: attention/MLP critical sections upcast to fp32 |
-| v2 | Speed: fp16 SDPA + scaled fc2 (10s/step @ 352×608) |
-| v3 | Power-of-2 scaling compensation, fully fp16 pipeline (no more long-seq regression) |
-| v4 | qkv check syncs 3→1 |
-| v5 | Chunked MLP; long-seq activation peak independent of seq length (110→97s/step) |
-| v6.0 | **Fully fp16 MLP (gate scaling), fp32 cast bandwidth eliminated; mathematically cannot overflow** |
-| v6.1 | MLP per-chunk 2 scans merged into 1; profile switch fixed |
-| v6.2 | MLP fixed scaling (bs=16/fs=8), zero per-chunk scans |
-| **v6.3** | **Attention fixed /256 scaling, zero scans (q/k restored by RMSNorm, v scaled through linear chain); per-layer syncs 11→2; ref2va fp8 480p/10s measured 75-78s/step** |
+| v6.0.0 | Fully fp16 MLP (gate scaling), fp32 cast bandwidth eliminated; mathematically cannot overflow |
+| **v6.3.0** | **Attention fixed /256 scaling, zero scans (q/k restored by RMSNorm, v scaled through linear chain); per-layer syncs 11→2; ref2va fp8 480p/10s measured 75-78s/step** |
 
 ## License
 
