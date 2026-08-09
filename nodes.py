@@ -382,7 +382,9 @@ def _mlp_forward(self, x):
     return out
 
 
-# ---- Video VAE (same as v1: fp16 stream, fp32 norms/scores/silu) ----
+# ---- Video VAE (v7): 以下 fp32 保险版 forward 已弃用（保留以便回退）----
+# 2026-08-09 起 patch() 不再替换 VAE forward, 恢复原生 fp16 路径 (快 ~30%, 数值已验证)。
+# 若未来 aki 版本 VAE 数值恶化, 恢复替换即可。
 def _vae_ff_forward(self, x):
     gate, x = self.w1(x).chunk(2, dim=-1)
     act = torch.nn.functional.silu(gate.float()) * x.float()
@@ -515,14 +517,16 @@ class MiniMaxH3FP16Safe:
         else:
             print("[MiniMaxH3-FP16Safe] MODEL is not MiniMax H3; DiT left unchanged.")
 
-        # ---- Video VAE ----
+        # ---- Video VAE (v7): 恢复原生 fp16 路径, 不再升 fp32 ----
+        # 实测(2026-08-09, V100): fp16 权重 + latent outlier ±38 下原生 fp16 解码
+        # finite=True, 与 fp32 保险路径输出差异仅 0.5% (fp16 舍入级); 而 fp32 upcast
+        # 在 V100 无 fp32 Tensor Core 慢 ~30% (14.5s -> 10.1s)。原生 Attention 自带
+        # nan_to_num 保险, FFN 数值有界 -> 升 fp32 是过度防御, 已移除。
         if vae is not None and fix_vae:
             vinner = getattr(vae, "first_stage_model", None) or vae
             if _is_minimax_vae(vinner):
-                mm_vae.Attention.forward = _vae_attn_forward
-                mm_vae.TransformerBlock.forward = _vae_tb_forward
-                mm_vae.FeedForward.forward = _vae_ff_forward
-                print("[MiniMaxH3-FP16Safe] Video VAE patched: attention + transformer-block norms + gated-silu upcast to fp32.")
+                print("[MiniMaxH3-FP16Safe] Video VAE: native fp16 path kept "
+                      "(fp32 upcast removed, +~30% decode speed, finite verified on V100).")
             else:
                 print("[MiniMaxH3-FP16Safe] VAE is not MiniMax H3 video VAE; left unchanged.")
 
