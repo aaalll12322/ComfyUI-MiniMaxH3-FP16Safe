@@ -1,6 +1,6 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.3.0**
+**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.5.0**
 
 > English version: [README_EN.md](README_EN.md)
 
@@ -34,18 +34,13 @@ git clone https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
 
 ```
 UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSampler 等）
-     │              ▲  │
-     │              │  └──> vae ──> VAE Decode（视频解码）
-     └── vae ───────┘
 ```
 
 - **`model`（必接）**：UNET 加载器的输出，可接在"模型计算Dtype"节点之后（插件也会强制 fp16）。
-- **`vae`（推荐）**：视频 VAE 加载器输出。连接后插件对视频 VAE 打 fp16 稳定补丁（防解码端 NaN/黑图）。
-- **`fix_vae`**（默认开）：是否应用视频 VAE 补丁。
 - **`debug_nan`**（默认关）：打印第一个出现非有限值的 DiTBlock 索引，用于故障定位。
 - **`profile`**（默认关）：打印 block 2/5/10/25/50 的 attention/MLP/其他 累计耗时与当前显存，用于速度瓶颈定位。
 
-> 音频 VAE 与文本编码器不受本插件影响，按原工作流接线即可。
+> 音频 VAE、视频 VAE 与文本编码器均不受本插件影响，按原工作流接线即可（v6.4.0 起视频 VAE 已实测原生 fp16 安全，无需补丁）。
 
 ---
 
@@ -61,7 +56,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | MLP | **全 fp16 + 固定缩放零扫描**：fc1 输出（实测 max≈585）保持 fp16；gated-silu 固定 ÷16（act ≤ 21.4k，3.4× 裕量）、fc2 固定 ÷8（输出 ≤ 22.7k），全部 2 的幂精确；末尾 fp32 还原。**零 fp32 中间张量、零逐块扫描** |
 | 长序列 | **分块 MLP**：按 16384 行切块单遍处理，激活峰值与 seq 无关（~9GB），避免 16GB 卡上 lowvram 换出雪崩 |
 | Qwen 文本路径（condition_proj） | fp32（防真实 context max≈21k 溢出） |
-| 视频 VAE | fp16 流，仅 norm/attention 分数/silu 升 fp32 |
+| 视频 VAE | 不处理（原生 fp16 路径，v6.4.0 实测有限：含 outlier ±38 解码 finite，与 fp32 差异仅 0.5%） |
 
 **保险丝机制**：fp16 快速路径后检查 `torch.isfinite()`，罕见溢出时自动用 fp32 重算该段——**保证永不 NaN**（固定缩放的数学上界使保险丝几乎不触发，仅作安全网）。
 
@@ -88,7 +83,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | 配置 | 每步耗时 | 说明 |
 |---|---|---|
 | 纯 fp16（无插件） | 63s | NaN → 不可用 |
-| **插件 v6.3.0（固定缩放零扫描）** | **75-78s（ref2va fp8）** | fp32 残差流 + fp16 Tensor Core，逼近无插件基线 |
+| **插件 v6.5.0（固定缩放零扫描）** | **75-78s（ref2va fp8）** | fp32 残差流 + fp16 Tensor Core，逼近无插件基线 |
 
 已验证模型：`minimax_h3_fl2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_int8_convrot`（均正常出片；fp8 版比 int8 版快约 9s/步，V100 推荐 fp8）。
 
@@ -98,8 +93,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 
 ```
 [MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6.3-FIXEDATTN] DiT patched: fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
-[MiniMaxH3-FP16Safe] Video VAE patched: attention + transformer-block norms + gated-silu upcast to fp32.
+[MiniMaxH3-FP16Safe][V6.5-INSTPATCH] DiT patched (instance-level, 251 modules): fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
 ```
 
 若 DiT 一行打印 "MODEL is not MiniMax H3"，说明检测未命中，请检查模型是否为 MiniMax H3 系列。
@@ -112,9 +106,9 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 |---|---|
 | 节点找不到 / `IMPORT FAILED` | 确认 ComfyUI 含 PR #15224（`comfy/ldm/minimax` 存在）；升级 ComfyUI 后重试 |
 | 采样仍有 NaN | 打开 `debug_nan`，把 `[MiniMaxH3-FP16Safe][DEBUG]` 输出发来（带 block 索引与输入/输出区分） |
-| 采样正常但解码黑 | 确认 VAE 输入已连到本节点（未连则视频 VAE 无补丁） |
+| 采样正常但解码黑 | 属 v6.4.0 之前的旧版行为；当前版本节点无 VAE 端口、VAE 走原生路径，若仍黑请升级 ComfyUI 并确认视频 VAE 加载正常 |
 | 速度慢于预期 | 打开 `profile`，把 `[MiniMaxH3-FP16Safe][PROF]` 输出发来（每阶段耗时定位瓶颈） |
-| VAE 报 dtype 不匹配 | 属旧版 bug，当前版本已修复；确认加载的是本插件 |
+| 节点显示红色/找不到（旧工作流） | v6.5.0 移除旧 ID `MiniMaxH3FP16SafeV2` 兼容别名，旧工作流需手动重新选择节点 |
 
 ---
 

@@ -1,6 +1,6 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**fp16 stability + speed plugin for the MiniMax H3 audio/video DiT (ComfyUI custom node) · v6.3.0**
+**fp16 stability + speed plugin for the MiniMax H3 audio/video DiT (ComfyUI custom node) · v6.5.0**
 
 中文版见 [README.md](README.md) / Chinese version: [README.md](README.md)
 
@@ -34,18 +34,13 @@ Restart ComfyUI. Find the **"MiniMax H3 FP16 Safe"** node under the `MiniMaxH3` 
 
 ```
 UNET Loader ──> MiniMax H3 FP16 Safe ──> model ──> Sampler (KSampler, etc.)
-     │              ▲  │
-     │              │  └──> vae ──> VAE Decode (video)
-     └── vae ───────┘
 ```
 
 - **`model` (required)**: output of the UNET Loader. Can be chained after a "Model Compute Dtype" node (the plugin also forces fp16 itself).
-- **`vae` (recommended)**: output of the video VAE Loader. When connected, the plugin applies an fp16-stability patch to the video VAE (prevents NaN/black frames on the decode side).
-- **`fix_vae`** (default on): whether to apply the video VAE patch.
 - **`debug_nan`** (default off): prints the index of the first DiTBlock where non-finite values appear, for fault diagnosis.
 - **`profile`** (default off): prints cumulative attention/MLP/other timings and current VRAM for blocks 2/5/10/25/50, to locate speed bottlenecks.
 
-> The audio VAE and the text encoder are unaffected; wire them as in your original workflow.
+> The audio VAE, video VAE and text encoder are all unaffected; wire them as in your original workflow (since v6.4.0 the video VAE has been verified safe in native fp16, no patch needed).
 
 ---
 
@@ -61,7 +56,7 @@ Idea: **fp32 residual stream (stable accumulation) + fp16 big matmuls (Tensor Co
 | MLP | **Fully fp16 + fixed-scale, zero scans**: fc1 output (measured max ≈585) stays fp16; gated-silu fixed ÷16 (act ≤ 21.4k, 3.4× headroom), fc2 fixed ÷8 (output ≤ 22.7k), all exact powers of 2; fp32 unscale at the end. **Zero fp32 intermediate tensors, zero per-chunk scans** |
 | Long sequences | **Chunked MLP**: processed in 16384-row chunks in a single pass; activation peak is independent of seq length (~9GB), avoiding lowvram weight-eviction thrash on 16GB cards |
 | Qwen text path (condition_proj) | fp32 (real context max ≈21k would overflow) |
-| Video VAE | fp16 stream; only norms/attention scores/silu upcast to fp32 |
+| Video VAE | Not patched (native fp16 path; since v6.4.0 verified finite with ±38 outliers, ~0.5% output diff vs fp32) |
 
 **Fuse mechanism**: the fp16 fast path is followed by a `torch.isfinite()` check; on a rare overflow the segment is recomputed in fp32 — **guaranteed no NaN** (the fixed scales have mathematical bounds, so the fuse almost never fires; it is only a safety net).
 
@@ -88,7 +83,7 @@ Long seq (480p/10s, seq ≈ 98.5k, V100, DiT offload environment, real 4-step sa
 | Config | Time per step | Notes |
 |---|---|---|
 | Pure fp16 (no plugin) | 63s | NaN → unusable |
-| **Plugin v6.3.0 (fixed-scale, zero scans)** | **75-78s (ref2va fp8)** | fp32 residual stream + fp16 Tensor Cores, near the no-plugin baseline |
+| **Plugin v6.5.0 (fixed-scale, zero scans)** | **75-78s (ref2va fp8)** | fp32 residual stream + fp16 Tensor Cores, near the no-plugin baseline |
 
 Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_int8_convrot` (all produce valid video; fp8 is ~9s/step faster than int8 on V100 — fp8 recommended).
 
@@ -98,8 +93,7 @@ Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned
 
 ```
 [MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6.3-FIXEDATTN] DiT patched: fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
-[MiniMaxH3-FP16Safe] Video VAE patched: attention + transformer-block norms + gated-silu upcast to fp32.
+[MiniMaxH3-FP16Safe][V6.5-INSTPATCH] DiT patched (instance-level, 251 modules): fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
 ```
 
 If the DiT line prints "MODEL is not MiniMax H3", the detection did not match — check whether your model is from the MiniMax H3 family.
@@ -112,9 +106,9 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 |---|---|
 | Node missing / `IMPORT FAILED` | Confirm ComfyUI includes PR #15224 (`comfy/ldm/minimax` exists); update ComfyUI and retry |
 | Sampling still NaN | Enable `debug_nan` and share the `[MiniMaxH3-FP16Safe][DEBUG]` output (block index + input/output distinction) |
-| Sampling fine but decode is black | Make sure the VAE input is connected to this node (otherwise the video VAE is unpatched) |
+| Sampling fine but decode is black | Behavior of pre-v6.4.0 versions; the current node has no VAE port (VAE runs natively). If still black, update ComfyUI and verify the video VAE loads properly |
 | Slower than expected | Enable `profile` and share the `[MiniMaxH3-FP16Safe][PROF]` output (per-stage timings) |
-| VAE dtype mismatch | Old-version bug, fixed in the current version; make sure you are loading this plugin |
+| Node red/missing (old workflows) | v6.5.0 removed the legacy alias `MiniMaxH3FP16SafeV2`; re-select the node manually in old workflows |
 
 ---
 
