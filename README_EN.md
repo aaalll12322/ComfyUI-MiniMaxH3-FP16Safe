@@ -134,6 +134,7 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 | v6.0.0 | Fully fp16 MLP (gate scaling), fp32 cast bandwidth eliminated; mathematically cannot overflow |
 | **v6.3.0** | **Attention fixed /256 scaling, zero scans (q/k restored by RMSNorm, v scaled through linear chain); per-layer syncs 11→2; ref2va fp8 480p/10s measured 75-78s/step** |
 | v6.4.0 | Video VAE back to native fp16 path (fp32 upcast removed): measured finite decode (even with ±38 outliers), ~0.5% output diff vs fp32 path, ~30% faster (14.5s→10.1s) |
+| **v6.5.0** | **Slimmer node + instance-level patching**: removed vae in/out ports and fix_vae (VAE handled natively by ComfyUI); patch now applies only to the current model instance (class methods untouched), deleting the node from a workflow no longer leaves a "ghost" patch active |
 
 ## License
 

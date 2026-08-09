@@ -134,6 +134,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | v6.0.0 | 全 fp16 MLP（gate 缩放），消除 fp32 cast 带宽；数学上不可能溢出 |
 | **v6.3.0** | **attention 固定 /256 缩放零扫描（q/k RMSNorm 还原、v 线性链缩放）；每层同步 11→2 次；ref2va fp8 480p/10s 实测 75-78s/步** |
 | v6.4.0 | Video VAE 恢复原生 fp16 路径（去掉 fp32 升精度）：实测 fp16 解码 finite（含 ±38 outlier），与 fp32 路径差异仅 0.5%，解码提速 ~30%（14.5s→10.1s） |
+| **v6.5.0** | **节点精简 + 实例级 patch**：移除 vae 输入/输出端口与 fix_vae（VAE 由 ComfyUI 原生处理）；patch 改为只作用于当前模型实例（类方法不再被改），工作流中删除节点后不再"幽灵生效" |
 
 ## License
 

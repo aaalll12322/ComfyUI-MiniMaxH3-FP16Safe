@@ -46,35 +46,15 @@ except Exception:
     _comfy_quant_ops = None
 try:
     import comfy.ldm.minimax.model as mm_model
-    import comfy.ldm.minimax.vae as mm_vae
     MINIMAX_AVAILABLE = True
     _IMPORT_ERR = None
 except Exception as e:
     mm_model = None
-    mm_vae = None
     MINIMAX_AVAILABLE = False
     _IMPORT_ERR = e
 
 ck = getattr(_comfy_quant_ops, "ck", None)
 _ORIG_OPT = getattr(attn_mod, "optimized_attention", None)
-
-
-def _rms_norm_fallback(x, weight, eps):
-    var = x.pow(2).mean(-1, keepdim=True)
-    return x * torch.rsqrt(var + eps) * weight
-
-
-def _fp32_opt(q, k, v, heads, *args, **kwargs):
-    """fp32 attention (used by the VAE path only; the DiT uses fp16 SDPA)."""
-    if _ORIG_OPT is not None:
-        qf, kf, vf = q.float(), k.float(), v.float()
-        kwargs["attn_precision"] = torch.float32
-        return _ORIG_OPT(qf, kf, vf, heads, *args, **kwargs)
-    b, _, _, dh = q.shape
-    qf, kf, vf = (t.reshape(-1, t.shape[-2], dh).float() for t in (q, k, v))
-    sim = torch.einsum("b i d, b j d -> b i j", qf, kf) * (dh ** -0.5)
-    out = torch.einsum("b i j, b j d -> b i d", torch.softmax(sim, dim=-1), vf)
-    return out.reshape(b, heads, -1, dh)
 
 
 class _FP32RMSNorm(torch.nn.Module):
@@ -382,50 +362,10 @@ def _mlp_forward(self, x):
     return out
 
 
-# ---- Video VAE (v7): 以下 fp32 保险版 forward 已弃用（保留以便回退）----
-# 2026-08-09 起 patch() 不再替换 VAE forward, 恢复原生 fp16 路径 (快 ~30%, 数值已验证)。
-# 若未来 aki 版本 VAE 数值恶化, 恢复替换即可。
-def _vae_ff_forward(self, x):
-    gate, x = self.w1(x).chunk(2, dim=-1)
-    act = torch.nn.functional.silu(gate.float()) * x.float()
-    return self.w2(act.clamp(-65504.0, 65504.0).to(x.dtype))
-
-
-def _vae_attn_forward(self, x, rotary_pos_emb=None):
-    batch_size, seq_len, _ = x.shape
-    qkv = self.to_qkv(x)
-    qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
-    query, key, value = torch.chunk(qkv, 3, dim=-1)
-    if _comfy_rmsnorm is not None:
-        query = _comfy_rmsnorm.rms_norm(query.float(), self.norm_q.weight, self.norm_q.eps).to(x.dtype)
-        key = _comfy_rmsnorm.rms_norm(key.float(), self.norm_k.weight, self.norm_k.eps).to(x.dtype)
-    else:
-        query = _rms_norm_fallback(query.float(), self.norm_q.weight, self.norm_q.eps).to(x.dtype)
-        key = _rms_norm_fallback(key.float(), self.norm_k.weight, self.norm_k.eps).to(x.dtype)
-    if rotary_pos_emb is not None and ck is not None:
-        rot = rotary_pos_emb.shape[-3] * 2
-        query[..., :rot], key[..., :rot] = ck.apply_rope_split_half(
-            query[..., :rot], key[..., :rot], rotary_pos_emb)
-    out = _fp32_opt(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
-                    self.heads, skip_reshape=True).nan_to_num_(0.0).to(x.dtype)
-    return self.to_out(out)
-
-
-def _vae_tb_forward(self, x, rotary_pos_emb=None):
-    cti = _comfy_ops.cast_to_input if _comfy_ops is not None else (lambda w, i: w.to(i.dtype))
-    if _comfy_rmsnorm is not None:
-        n1 = _comfy_rmsnorm.rms_norm(x.float(), self.norm1.weight, self.norm1.eps).to(x.dtype)
-    else:
-        n1 = _rms_norm_fallback(x.float(), self.norm1.weight, self.norm1.eps).to(x.dtype)
-    a = self.attn(n1, rotary_pos_emb)
-    x = x.addcmul_(a, cti(self.scale1, x))
-    if _comfy_rmsnorm is not None:
-        n2 = _comfy_rmsnorm.rms_norm(x.float(), self.norm2.weight, self.norm2.eps).to(x.dtype)
-    else:
-        n2 = _rms_norm_fallback(x.float(), self.norm2.weight, self.norm2.eps).to(x.dtype)
-    f = self.ff(n2)
-    return x.addcmul_(f, cti(self.scale2, x))
-
+# ---- Video VAE (v7): 不再 patch VAE ----
+# 2026-08-09 实测: VAE 原生 fp16 解码 finite=True (含 outlier ±38), 与 fp32 保险路径
+# 差异仅 0.5%, 且快 ~30%; 原生 Attention 自带 nan_to_num 保险。故插件完全不管 VAE,
+# 节点也不再有 vae 输入/输出端口。
 
 def _is_minimax_dit(inner):
     if inner is None or not hasattr(inner, "modules"):
@@ -438,39 +378,26 @@ def _is_minimax_dit(inner):
     return False
 
 
-def _is_minimax_vae(inner):
-    if inner is None or not hasattr(inner, "modules"):
-        return False
-    if any(type(m).__name__ == "MiniMaxH3VideoVAE" for m in inner.modules()):
-        return True
-    for m in inner.modules():
-        if all(hasattr(m, a) for a in ("to_qkv", "norm_q", "to_out")):
-            return True
-    return False
-
-
 class MiniMaxH3FP16Safe:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {"model": ("MODEL",)},
             "optional": {
-                "vae": ("VAE",),
-                "fix_vae": ("BOOLEAN", {"default": True}),
                 "debug_nan": ("BOOLEAN", {"default": False}),
                 "profile": ("BOOLEAN", {"default": False, "tooltip": "打印每阶段耗时(block 2/5/10/25/50)与显存, 定位速度瓶颈"}),
             },
         }
 
-    RETURN_TYPES = ("MODEL", "VAE")
+    RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
     CATEGORY = "MiniMaxH3"
 
-    def patch(self, model, vae=None, fix_vae=True, debug_nan=False, profile=False):
+    def patch(self, model, debug_nan=False, profile=False):
         if not MINIMAX_AVAILABLE:
             print("[MiniMaxH3-FP16Safe] comfy.ldm.minimax backend not found (%s). "
                   "Update ComfyUI to a build that includes PR #15224." % _IMPORT_ERR)
-            return (model, vae)
+            return (model,)
 
         # ---- 强制 fp16 计算: MiniMaxH3 官方 supported=[bf16,fp32] 不含 fp16,
         # V100 无 bf16 硬件 -> aki 兜底 cast 成 fp32 (慢 4x, 无 Tensor Core)。
@@ -481,18 +408,31 @@ class MiniMaxH3FP16Safe:
         except Exception as e:
             print("[MiniMaxH3-FP16Safe] WARNING: set_model_compute_dtype(fp16) failed: %s" % e)
 
-        # ---- DiT (UNet) ----
+        # ---- DiT (UNet): 实例级 forward patch (不再改类方法, 避免全局生效) ----
+        # 只替换当前 model 实例内模块的 forward; 之后新加载的其他 MiniMax 模型
+        # (工作流中无本节点) 保持原生 forward。V100 的 fp16 修正只作用于本实例。
+        import types as _types
         global _PROFILE, _prof
         # 节点开关可真正关闭; 只有环境变量显式开启时 profile 才强制打开
         _PROFILE = _ENV_PROFILE or bool(profile)
         _prof = {"attn": 0.0, "mlp": 0.0, "other": 0.0, "n": 0}   # 每次 patch 重置累计, 避免跨多次运行叠加
         inner = getattr(model, "model", None)
         if _is_minimax_dit(inner):
-            mm_model.Attention.forward = _dit_attn_forward
-            mm_model.DiTBlock.forward = _dit_block_forward
-            mm_model.RefinerBlock.forward = _refiner_block_forward
-            mm_model.MLP.forward = _mlp_forward
             target = getattr(inner, "diffusion_model", None) or inner
+            patched = 0
+            for m in target.modules():
+                if isinstance(m, mm_model.DiTBlock):
+                    m.forward = _types.MethodType(_dit_block_forward, m)
+                    patched += 1
+                elif isinstance(m, mm_model.RefinerBlock):
+                    m.forward = _types.MethodType(_refiner_block_forward, m)
+                    patched += 1
+                elif isinstance(m, mm_model.MLP):
+                    m.forward = _types.MethodType(_mlp_forward, m)
+                    patched += 1
+                elif isinstance(m, mm_model.Attention):
+                    m.forward = _types.MethodType(_dit_attn_forward, m)
+                    patched += 1
             n = _wrap_rmsnorms(target)
             wrapped_cond = 0
             for m in target.modules():
@@ -508,60 +448,59 @@ class MiniMaxH3FP16Safe:
                         break
             except Exception:
                 pass
-            print("[MiniMaxH3-FP16Safe][V6.3-FIXEDATTN] DiT patched: fp32 residual stream + fp16 SDPA attention "
-                  "(fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
-                  "(profile=%s)" % (n, wrapped_cond, _PROFILE))
+            print("[MiniMaxH3-FP16Safe][V6.5-INSTPATCH] DiT patched (instance-level, %d modules): "
+                  "fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + "
+                  "fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
+                  "(profile=%s)" % (patched, n, wrapped_cond, _PROFILE))
 
             if debug_nan:
                 self._install_nan_debug(mm_model, target)
         else:
             print("[MiniMaxH3-FP16Safe] MODEL is not MiniMax H3; DiT left unchanged.")
 
-        # ---- Video VAE (v7): 恢复原生 fp16 路径, 不再升 fp32 ----
-        # 实测(2026-08-09, V100): fp16 权重 + latent outlier ±38 下原生 fp16 解码
-        # finite=True, 与 fp32 保险路径输出差异仅 0.5% (fp16 舍入级); 而 fp32 upcast
-        # 在 V100 无 fp32 Tensor Core 慢 ~30% (14.5s -> 10.1s)。原生 Attention 自带
-        # nan_to_num 保险, FFN 数值有界 -> 升 fp32 是过度防御, 已移除。
-        if vae is not None and fix_vae:
-            vinner = getattr(vae, "first_stage_model", None) or vae
-            if _is_minimax_vae(vinner):
-                print("[MiniMaxH3-FP16Safe] Video VAE: native fp16 path kept "
-                      "(fp32 upcast removed, +~30% decode speed, finite verified on V100).")
-            else:
-                print("[MiniMaxH3-FP16Safe] VAE is not MiniMax H3 video VAE; left unchanged.")
-
-        return (model, vae)
+        return (model,)
 
     @staticmethod
     def _install_nan_debug(mm_model, target=None):
-        base = mm_model.DiTBlock.forward
+        """实例级 NaN 检测: 包装每个 DiTBlock 实例的 forward (基于实例当前 forward,
+        即已安装的 fp16 patch), 不再做类级替换, 不影响其他模型实例。"""
+        import types as _types
+        if target is None:
+            print("[MiniMaxH3-FP16Safe] debug_nan: no target, skipped.")
+            return
+        try:
+            blocks = None
+            for m in target.modules():
+                if isinstance(m, mm_model.MiniMaxH3Model):
+                    blocks = m.blocks
+                    break
+        except Exception:
+            blocks = None
+        if not blocks:
+            print("[MiniMaxH3-FP16Safe] debug_nan: no MiniMaxH3Model found, skipped.")
+            return
         state = {"reported": False}
-        if target is not None:
-            try:
-                for m in target.modules():
-                    if isinstance(m, mm_model.MiniMaxH3Model):
-                        for i, blk in enumerate(m.blocks):
-                            blk._dbg_index = i
-                        break
-            except Exception:
-                pass
+        for blk in blocks:
+            idx = getattr(blk, "_dbg_index", -1)
+            base = blk.forward  # 实例当前 forward (可能已是 fp16 patch)
 
-        def checking(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}):
-            idx = getattr(self, "_dbg_index", "?")
-            if not state["reported"] and not torch.isfinite(x).all():
-                print("[MiniMaxH3-FP16Safe][DEBUG] DiTBlock %s INPUT already non-finite "
-                      "(finite %.4f) -> NaN originates BEFORE the blocks (embedding/refiner/context)" % (
-                          idx, torch.isfinite(x).float().mean().item()))
-                state["reported"] = True
-            out = base(self, x, t_emb, mod_segments, rope_freqs, transformer_options)
-            if not state["reported"] and not torch.isfinite(out).all():
-                print("[MiniMaxH3-FP16Safe][DEBUG] non-finite value first seen at DiTBlock %s "
-                      "(finite ratio %.4f)" % (idx, torch.isfinite(out).float().mean().item()))
-                state["reported"] = True
-            return out
+            def checking(self, x, t_emb, mod_segments, rope_freqs, transformer_options={},
+                         _base=base, _idx=idx, _state=state):
+                if not _state["reported"] and not torch.isfinite(x).all():
+                    print("[MiniMaxH3-FP16Safe][DEBUG] DiTBlock %s INPUT already non-finite "
+                          "(finite %.4f) -> NaN originates BEFORE the blocks "
+                          "(embedding/refiner/context)" % (
+                              _idx, torch.isfinite(x).float().mean().item()))
+                    _state["reported"] = True
+                out = _base(x, t_emb, mod_segments, rope_freqs, transformer_options)
+                if not _state["reported"] and not torch.isfinite(out).all():
+                    print("[MiniMaxH3-FP16Safe][DEBUG] non-finite value first seen at DiTBlock %s "
+                          "(finite ratio %.4f)" % (_idx, torch.isfinite(out).float().mean().item()))
+                    _state["reported"] = True
+                return out
 
-        mm_model.DiTBlock.forward = checking
-        print("[MiniMaxH3-FP16Safe] debug_nan enabled.")
+            blk.forward = _types.MethodType(checking, blk)
+        print("[MiniMaxH3-FP16Safe] debug_nan enabled (instance-level, %d blocks)." % len(blocks))
 
 
 NODE_CLASS_MAPPINGS = {
