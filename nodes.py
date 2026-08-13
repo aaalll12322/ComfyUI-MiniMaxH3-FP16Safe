@@ -156,15 +156,25 @@ def _qkv_scale_check(self, x, x_scale):
 
 
 # ---- DiT Attention (v6.3): ALWAYS-fp16 SDPA with FIXED power-of-2 scale ----
-# Zero per-layer scans. x (fp16 or fp32) is always divided by 256 (2^8, exact)
-# before qkv_proj, so qkv output is bounded by |x|/256 * ||W_qkv||. For |x| up
-# to 60000 (fp16 stream bound) and realistic weight norms this stays ~700, and
-# even |x|=1e6 (fp32, extreme) stays fp16-safe. q/k are restored exactly by
-# RMSNorm homogeneity (logits see O(1) values); v stays scaled through the
-# linear chain SDPA -> out_proj and is unscaled in fp32 after out_proj (small
-# [s, 3072] tensor). Bounds: |P@v| <= 706 (measured) -> scaled 2.76, out_proj
-# out ~39k/256 = 152 -> fp16 can never overflow.
-_ATTN_FIXED_SCALE = 256.0   # 2^8
+# Zero per-layer scans. x (fp16 or fp32) is always divided by the scale below
+# (an exact power of 2) before qkv_proj, so qkv output is bounded by
+# |x|/s * ||W_qkv||. q/k are restored by RMSNorm homogeneity; v stays scaled
+# through the linear chain SDPA -> out_proj and is unscaled in fp32 afterwards.
+#
+# The scale is bounded BELOW by overflow and ABOVE by accuracy:
+#   * overflow: the binding site is out_proj's output, the largest fp16 tensor
+#     in this path (~39k here; 1.43e5 measured at 1344x768/124f). s=16 leaves
+#     ~27x headroom on the former, 7.3x on the latter, with the isfinite fuse
+#     behind it.
+#   * accuracy: RMSNorm is scale-homogeneous only as eps -> 0, because
+#     rms_norm(q/s) = q / sqrt(ms_q + eps*s^2). With qk_norm_eps=1e-5, s=256
+#     makes that term 0.655, which is NOT small next to the live ms(q)
+#     (measured median ~9-10, min ~2.2 at block 0). Attention-output error vs
+#     an unprescaled fp32 reference on identical activations follows 1/s^2
+#     exactly, with no plateau:
+#         /256 cos 0.99973989 (max rel 7.2e-2)   /32 cos 0.99999994 (1.25e-3)
+#         /64  cos 0.99999893 (5.0e-3)           /16 cos 1.00000000 (3.1e-4)
+_ATTN_FIXED_SCALE = 16.0   # 2^4
 
 
 def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
