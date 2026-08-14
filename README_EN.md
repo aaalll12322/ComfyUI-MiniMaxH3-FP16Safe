@@ -1,6 +1,6 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**fp16 stability + speed plugin for the MiniMax H3 audio/video DiT (ComfyUI custom node) · v6.7.0**
+**fp16 stability + speed plugin for the MiniMax H3 audio/video DiT (ComfyUI custom node) · v6.8.0**
 
 中文版见 [README.md](README.md) / Chinese version: [README.md](README.md) · Development/design notes: [DEVELOPMENT_EN.md](DEVELOPMENT_EN.md) / [DEVELOPMENT.md](DEVELOPMENT.md)
 
@@ -85,7 +85,7 @@ Long seq (480p/10s, seq ≈ 98.5k, V100, DiT offload environment, real 4-step sa
 | Config | Time per step | Notes |
 |---|---|---|
 | Pure fp16 (no plugin) | 63s | NaN → unusable |
-| **Plugin v6.5.0 (fixed-scale, zero scans)** | **75-78s (ref2va fp8)** | fp32 residual stream + fp16 Tensor Cores, near the no-plugin baseline |
+| **Plugin v6.8.0 (zero per-block syncs + fixed-scale)** | **71-74s (ref2va fp8)** | fp32 residual stream + fp16 Tensor Cores, near the no-plugin baseline |
 
 Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_int8_convrot` (all produce valid video; fp8 is ~9s/step faster than int8 on V100 — fp8 recommended).
 
@@ -97,7 +97,7 @@ Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned
 [MiniMaxH3-FP16Safe] patching on a cloned ModelPatcher (cache object left untouched, Issue #2)
 [MiniMaxH3-FP16Safe] structure-cloned model tree (params shared, module instances isolated)
 [MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6.7-STRUCTCLONE] DiT patched (instance-level, 156 modules): fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
+[MiniMaxH3-FP16Safe][V6.8-NOSYNC] DiT patched (instance-level, 156 modules): fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. zero per-block GPU syncs (deferred fuse, fwd_wrapped=1). (profile=False)
 ```
 
 If the DiT line prints "MODEL is not MiniMax H3", the detection did not match — check whether your model is from the MiniMax H3 family.
@@ -136,6 +136,7 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 | **v6.5.0** | **Slimmer node + instance-level patching**: removed vae in/out ports and fix_vae (VAE handled natively by ComfyUI); patch now applies only to the current model instance (class methods untouched), deleting the node from a workflow no longer leaves a "ghost" patch active |
 | **v6.6.0** | **Attention fixed scale 256→16 (PR #1, +240× accuracy, still ≥7× overflow headroom) + Issue #2 fix (patch runs on a clone, so removing the node no longer leaves fp16 compute on the cached model)** |
 | **v6.7.0** | **Structure-clone isolation (Issue #2, forward side)**: the module tree is recursively rebuilt at patch time (weights shared, module instances isolated), so cached objects keep their native forward — no model reload needed after removing the node |
+| **v6.8.0** | **Zero per-block GPU syncs (deferred fuse)**: the 2 magnitude probes are dropped (real-model measurement: attention/MLP input peak 78.5 vs fp16 limit 65504, 830× headroom — unconditional downcast is bit-identical to the conditional one), and the isfinite fuses now accumulate a flag on-GPU and are checked once per forward (a trip re-runs the forward in fp32). ref2va fp8 480p/10s measured 75-78 → 71-74 s/step |
 
 ## License
 

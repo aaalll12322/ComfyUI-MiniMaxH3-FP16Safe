@@ -56,6 +56,23 @@ V100（sm_70）**没有 bf16 硬件**，官方路径只能回落 fp32（约慢 4
 
 **v6.7.0 起补上结构克隆**：`ModelPatcher.clone()` 只隔离 dtype 状态、**不深拷贝模型实例**——实例级 forward patch 打在共享模块上，仍会残留在缓存的 UNETLoader 输出里（删节点重跑仍是插件行为）。现在 patch 前先递归重建模块树（权重参数共享、模块实例隔离），缓存对象永远保持原生 forward（见 §6.1）。
 
+**v6.8.0 起零每 block GPU 同步（deferred fuse）**。每个 DiTBlock 原来有 4 次 GPU→CPU 同步：
+
+```
+1. _fp16_safe(attn 输入)   → h.abs().max().item()   ← 探针
+2. _fp16_safe(MLP 输入)    → h.abs().max().item()   ← 探针
+3. attention 保险丝        → isfinite(proj).all()   ← 检查
+4. MLP 保险丝              → isfinite(out).all()    ← 检查
+```
+
+每次 `.item()`/`.all()` 都要 GPU 算完 → 结果传回 CPU → Python 判断 → 才能发下一个 kernel。在 V100 16GB 低显存环境，权重逐层从内存搬运（DiT 21.6GB 放不下），每次同步还会打断 CPU→GPU 权重预取流水线——GPU 干等，比模型驻留的机器更贵。
+
+**为什么探针能直接删掉**：探针的作用是"h 安全才降 fp16、不安全保持 fp32"，但真机实测（真实模型 fl2va fp8 + turbo LoRA，52 层×2 输入）attn/MLP 输入 h 的峰值只有 **78.5**，而 fp16 上限 65504——**830× 余量**。v6.3 起所有固定缩放都有数学上界（qkv/out_proj/fc1/fc2 都不可能溢出），h 本身又远在范围内 → 探针是纯冗余开销。无条件降 fp16 在真实激活下与条件降**逐位等价**。
+
+**为什么保险丝"延后"而不是删掉**：保险丝是安全网（理论上界之外的极端 outlier 兜底，保证永不 NaN），但检查时机可以挪——原来每 block 检查（= 4 次同步的一部分），现在改为 GPU 上累积 flag（`_FUSE_FLAG |= ~isfinite(out).any()`，不 `.item()` 就不打断流水线），在 `MiniMaxH3Model.forward` 包装里**每 forward 只查一次**；万一触发（数学上界保证从不触发）整 forward 用 fp32 重跑一次兜底，正确性有保障。
+
+**收益（本地实测，ref2va fp8，480p/10s，V100-16GB）**：75-78 → 71-74 s/步（-4~5s）。相对无插件基线（63s）插件开销只剩 fp32 残差流 + refs 附加 token 的固有成本（+8~11s），逼近理论下限。
+
 ---
 
 ## 3. attention 的固定缩放（核心数学）
@@ -216,6 +233,7 @@ q_s  = rms_norm(q/s) 精确形式    = q / sqrt(ms(q) + eps·s²)
 | v6.5.0 | 实例级 patch（forward 层面不再幽灵生效）；移除旧节点 ID 别名 |
 | v6.6.0 | **attention 固定缩放 256 → 16**（PR #1，精度 +240×，溢出余量仍 ≥7×）；**Issue #2 修复**（patch 在 clone 上执行，缓存对象不再被 dtype 污染） |
 | v6.7.0 | **结构克隆隔离（Issue #2 forward 侧）**：`ModelPatcher.clone()` 不深拷贝模型实例，forward patch 仍会残留进缓存对象；递归重建模块树（参数共享、实例隔离），缓存对象保持原生 forward |
+| v6.8.0 | **零每 block GPU 同步（deferred fuse）**：删 2 个 magnitude probe（真机实测 h 峰值 78.5 << 60000，无条件降与条件降等价）+ 保险丝 GPU 累积、每 forward 查一次（触发则整 forward fp32 重跑）；480p/10s 实测 75-78 → 71-74s/步 |
 
 ## License
 

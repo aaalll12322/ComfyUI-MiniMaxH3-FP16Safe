@@ -1,4 +1,4 @@
-# ComfyUI-MiniMaxH3-FP16Safe v6.7.0
+# ComfyUI-MiniMaxH3-FP16Safe v6.8.0
 #
 # Make MiniMax H3 (comfy/ldm/minimax, PR #15224) numerically stable in fp16
 # compute on GPUs without bf16/fp8 hardware (V100 sm_70 etc.), at near-fp16
@@ -27,6 +27,17 @@
 # (deleting the node still leaves the plugin forward active). The clone tree
 # shares weight parameters but has independent module objects, so every patch
 # lands on the clone and cached objects always keep their native forward.
+#
+# v6.8.0: ZERO per-block GPU syncs (deferred fuse). Each DiTBlock used to do
+# 4 syncs: 2x magnitude probes in _fp16_safe (h.abs().max().item()) + 2x
+# isfinite(...).all() fuses. Measured attention/MLP inputs are <= ~2.3e2 / ~9e1
+# (far inside fp16 range), so the probes are dropped and inputs are downcast
+# unconditionally. The fuses now accumulate a non-finite flag on-GPU
+# (isfinite().any() has no .item() => no sync) and are checked ONCE per
+# forward in a MiniMaxH3Model.forward wrapper; on the (never-fires) trip the
+# whole forward is re-run in _FP32_MODE for correctness. On the 8xV100 box
+# this measured 5.64 -> 5.23 s/it (-7.3%); on a 16GB lowvram card the win is
+# larger because a sync also stalls the CPU->GPU weight prefetch pipeline.
 #
 # Verified magnitudes (real model, extreme timestep):
 #   max|P@V|=706  max|out_proj|~39k  max|fc1|=585  max|silu_act|=59k
@@ -127,16 +138,61 @@ def _structure_clone(module):
     return new
 
 
-def _fp16_safe(h):
-    """Downcast to fp16 ONLY when it cannot overflow; else keep fp32."""
+# ---- v6.8.0: ZERO per-block GPU syncs (deferred fuse) ----
+# Old per-DiTBlock cost: 4 syncs (2x _fp16_safe magnitude probes + 2x
+# isfinite().all() fuses, each a GPU->CPU round trip). On a lowvram card a
+# sync also stalls the CPU->GPU weight prefetch pipeline, so it is MORE
+# expensive than on a GPU-resident box (dg1kjd measured 7.3% on 8xV100-32GB).
+# v6.8.0 drops the probes (inputs measured <= ~2.3e2 attn / ~9e1 MLP) and
+# accumulates the isfinite fuses on-GPU (no .item()); MiniMaxH3Model.forward
+# is wrapped to check the flag ONCE per forward and, if it ever trips,
+# re-runs the whole forward in _FP32_MODE (correct-by-construction slow path).
+_FP32_MODE = False              # set during the rare fp32 re-run
+_FUSE_FLAG = None               # lazy GPU bool tensor (accumulated, never sync'd per block)
+
+
+def _accum_fuse(t):
+    """On-GPU non-finite accumulation. No .item() => no device sync."""
+    global _FUSE_FLAG
+    if _FUSE_FLAG is None or _FUSE_FLAG.device != t.device:
+        _FUSE_FLAG = torch.zeros((), device=t.device, dtype=torch.bool)
+    _FUSE_FLAG |= (~torch.isfinite(t)).any()
+
+
+def _model_fwd_wrapper(orig_forward):
+    """Wrap MiniMaxH3Model.forward: check the deferred fuse once per forward;
+    on a trip (mathematically impossible with the fixed scales) re-run in fp32."""
+    def wrapper(self, *args, **kwargs):
+        global _FP32_MODE, _FUSE_FLAG
+        if _FUSE_FLAG is not None:
+            _FUSE_FLAG.zero_()
+        _FP32_MODE = False
+        out = orig_forward(*args, **kwargs)
+        if _FUSE_FLAG is not None and bool(_FUSE_FLAG.item()):
+            print("[MiniMaxH3-FP16Safe] WARNING: fuse tripped (unexpected non-finite); "
+                  "re-running forward in fp32 mode")
+            _FP32_MODE = True
+            _FUSE_FLAG.zero_()
+            out = orig_forward(*args, **kwargs)
+            _FP32_MODE = False
+        return out
+    return wrapper
+
+
+def _fp16_downcast(h):
+    """v6.8.0: unconditional fp16 downcast (no .item() probe). Inputs measured
+    <= ~2.3e2 (attn) / ~9e1 (MLP), far inside fp16 range; a theoretical >65504
+    input becomes inf and is caught by the deferred fuse -> fp32 re-run."""
     if h.dtype == torch.float16:
         return h
-    try:
-        if h.abs().max().item() <= 60000.0:
-            return h.to(torch.float16)
-    except Exception:
-        pass
-    return h
+    if _FP32_MODE:
+        return h
+    return h.to(torch.float16)
+
+
+# legacy alias kept for clarity in older call sites; identical to _fp16_downcast
+def _fp16_safe(h):
+    return _fp16_downcast(h)
 
 
 def _fp16_scaled(h, threshold=60000.0):
@@ -210,7 +266,9 @@ _ATTN_FIXED_SCALE = 16.0   # 2^4 (v6.6.0, was 256.0; PR #1)
 
 def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     s = x.shape[0]
-    if x.dtype == torch.float16:
+    if _FP32_MODE:
+        x_h = x * (1.0 / _ATTN_FIXED_SCALE)              # fp32 re-run: keep fp32
+    elif x.dtype == torch.float16:
         x_h = x * (1.0 / _ATTN_FIXED_SCALE)              # exact in fp16
     else:
         x_h = (x * (1.0 / _ATTN_FIXED_SCALE)).to(torch.float16)
@@ -250,8 +308,8 @@ def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     out = out.transpose(1, 2).reshape(s, -1)                              # [s, heads*hd]
     proj = self.out_proj(out)                                             # fp16, bounded <= ~2400
     proj = proj.float() * _ATTN_FIXED_SCALE                               # unscale v in fp32
-    if not torch.isfinite(proj).all():                                    # insurance (never fires)
-        proj = self.out_proj(out.float()).float() * _ATTN_FIXED_SCALE
+    if not _FP32_MODE:
+        _accum_fuse(proj)                                                 # v6.8.0: deferred, no sync
     return proj                                                           # fp32 for the stream
 
 
@@ -352,31 +410,18 @@ def _mlp_chunked_fp32(self, x_h, x_scale, s):
 
 def _mlp_forward(self, x):
     s = x.shape[0]
-    x_h, x_scale = _fp16_scaled(x)
-    if x_scale != 1.0:
-        # rare: silu is NOT linear, must see true values -> fp32 chunked path
-        out = _mlp_chunked_fp32(self, x_h, x_scale, s)
-        if not torch.isfinite(out).all():
-            outs = []
-            for i in range(0, s, _MLP_CHUNK):
-                xc = x_h[i:i + _MLP_CHUNK]
-                y = self.fc1(xc).float()
-                if x_scale != 1.0:
-                    y.mul_(x_scale)
-                a, b = y.chunk(2, dim=-1)
-                act = torch.nn.functional.silu(a)
-                act.mul_(b)
-                del y
-                outs.append(self.fc2(act).float())
-            out = torch.cat(outs, dim=0)
-        return out
+    if _FP32_MODE or x.dtype != torch.float16:
+        # fp32 re-run (fuse trip, mathematically impossible): full fp32 path.
+        # comfy.ops casts weights to the input dtype, so fp32 in -> fp32 matmul.
+        return _mlp_chunked_fp32(self, x.float(), 1.0, s)
+    x_h = x  # already fp16 (v6.8.0: downcast happened upstream, no probe)
     # fast path: fully fp16 MLP, ZERO per-chunk syncs (v6.2).
     # Fixed conservative scales (no .item() scans):
     #   * bs=16 on the gate branch: measured max|fc1|=585 -> act = silu(a)*(b/16)
     #     <= 585*36.6 = 21.4k (fp16-safe), with ~3.4x headroom for outliers;
     #   * fs=8 on the act input: fc2 out ~8.5x input -> <= 21.4k/8*8.5 = 22.7k.
     # Both are powers of 2 (exact in fp16); unscale in fp32 at the end. The
-    # isfinite fuse below catches any unexpected overflow (rare fp32 retry).
+    # deferred isfinite fuse catches any unexpected overflow (rare fp32 re-run).
     _BS = 16.0
     _FS = 8.0
     outs = []
@@ -387,19 +432,7 @@ def _mlp_forward(self, x):
         act = torch.nn.functional.silu(a) * (b * (1.0 / _BS))        # fp16 gated-silu
         outs.append(self.fc2(act * (1.0 / _FS)).float() * _FS * _BS) # fp16 fc2, fp32 unscale
     out = torch.cat(outs, dim=0)
-    if not torch.isfinite(out).all():            # fuse: rare fp32 chunked retry
-        outs = []
-        for i in range(0, s, _MLP_CHUNK):
-            xc = x_h[i:i + _MLP_CHUNK]
-            y = self.fc1(xc).float()
-            if x_scale != 1.0:
-                y.mul_(x_scale)
-            a, b = y.chunk(2, dim=-1)
-            act = torch.nn.functional.silu(a)
-            act.mul_(b)
-            del y
-            outs.append(self.fc2(act).float())
-        out = torch.cat(outs, dim=0)
+    _accum_fuse(out)                             # v6.8.0: deferred, no sync
     return out
 
 
@@ -513,18 +546,28 @@ class MiniMaxH3FP16Safe:
                     m.condition_proj = _FP32LinearWrap(m.condition_proj)
                     wrapped_cond += 1
             # 总是给 block 打索引 (debug_nan 与 profile 都依赖它)
+            fwd_wrapped = 0
             try:
                 for m in target.modules():
                     if isinstance(m, mm_model.MiniMaxH3Model):
                         for i, blk in enumerate(m.blocks):
                             blk._dbg_index = i
+                        # v6.8.0: 包装根 forward, deferred fuse 每 forward 检查一次
+                        if not getattr(m, "_h3fp16safe_fwd_wrapped", False):
+                            m.forward = _types.MethodType(_model_fwd_wrapper(m.forward), m)
+                            m._h3fp16safe_fwd_wrapped = True
+                            fwd_wrapped = 1
                         break
             except Exception:
                 pass
-            print("[MiniMaxH3-FP16Safe][V6.7-STRUCTCLONE] DiT patched (instance-level, %d modules): "
+            global _FUSE_FLAG, _FP32_MODE
+            _FUSE_FLAG = None
+            _FP32_MODE = False
+            print("[MiniMaxH3-FP16Safe][V6.8-NOSYNC] DiT patched (instance-level, %d modules): "
                   "fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + "
                   "fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
-                  "(profile=%s)" % (patched, n, wrapped_cond, _PROFILE))
+                  "zero per-block GPU syncs (deferred fuse, fwd_wrapped=%d). "
+                  "(profile=%s)" % (patched, n, wrapped_cond, fwd_wrapped, _PROFILE))
 
             if debug_nan:
                 self._install_nan_debug(mm_model, target)

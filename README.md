@@ -1,6 +1,6 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.7.0**
+**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.8.0**
 
 > English version: [README_EN.md](README_EN.md) · 开发/设计文档: [DEVELOPMENT.md](DEVELOPMENT.md) / [DEVELOPMENT_EN.md](DEVELOPMENT_EN.md)
 >
@@ -85,7 +85,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | 配置 | 每步耗时 | 说明 |
 |---|---|---|
 | 纯 fp16（无插件） | 63s | NaN → 不可用 |
-| **插件 v6.5.0（固定缩放零扫描）** | **75-78s（ref2va fp8）** | fp32 残差流 + fp16 Tensor Core，逼近无插件基线 |
+| **插件 v6.8.0（零每 block 同步 + 固定缩放）** | **71-74s（ref2va fp8）** | fp32 残差流 + fp16 Tensor Core，逼近无插件基线 |
 
 已验证模型：`minimax_h3_fl2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_int8_convrot`（均正常出片；fp8 版比 int8 版快约 9s/步，V100 推荐 fp8）。
 
@@ -97,7 +97,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 [MiniMaxH3-FP16Safe] patching on a cloned ModelPatcher (cache object left untouched, Issue #2)
 [MiniMaxH3-FP16Safe] structure-cloned model tree (params shared, module instances isolated)
 [MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6.7-STRUCTCLONE] DiT patched (instance-level, 156 modules): fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
+[MiniMaxH3-FP16Safe][V6.8-NOSYNC] DiT patched (instance-level, 156 modules): fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. zero per-block GPU syncs (deferred fuse, fwd_wrapped=1). (profile=False)
 ```
 
 若 DiT 一行打印 "MODEL is not MiniMax H3"，说明检测未命中，请检查模型是否为 MiniMax H3 系列。
@@ -136,6 +136,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | **v6.5.0** | **节点精简 + 实例级 patch**：移除 vae 输入/输出端口与 fix_vae（VAE 由 ComfyUI 原生处理）；patch 改为只作用于当前模型实例（类方法不再被改），工作流中删除节点后不再"幽灵生效" |
 | **v6.6.0** | **attention 固定缩放 256→16（PR #1，精度 +240×，溢出余量仍 ≥7×）+ Issue #2 修复（patch 在 clone 上执行，删除节点后缓存对象不再残留 fp16 compute）** |
 | **v6.7.0** | **结构克隆隔离（Issue #2 forward 侧）**：patch 时递归重建模块树（权重参数共享、模块实例隔离），删除节点后缓存对象保持原生 forward，无需重新加载模型 |
+| **v6.8.0** | **零每 block GPU 同步（deferred fuse）**：移除 2 个 magnitude probe（真机实测 attn/MLP 输入峰值 78.5，fp16 上限 65504 余量 830×，无条件降与条件降逐位等价）+ isfinite 保险丝改为 GPU 累积、每 forward 只查一次（触发则整 forward fp32 重跑兜底）；ref2va fp8 480p/10s 实测 75-78 → 71-74s/步 |
 
 ## License
 

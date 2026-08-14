@@ -56,6 +56,23 @@ V100 (sm_70) has **no bf16 hardware**, so the official path falls back to fp32 (
 
 **Since v6.7.0 this is backed by a structure clone**: `ModelPatcher.clone()` only isolates dtype state and **does not deep-copy the model instance** — instance-level forward patches written onto the shared modules would still leak into the cached UNETLoader output (deleting the node kept the plugin forward active). The module tree is now recursively rebuilt before patching (weight parameters shared, module instances isolated), so cached objects always keep their native forward (see §6.1).
 
+**Since v6.8.0: zero per-block GPU syncs (deferred fuse)**. Each DiTBlock used to perform 4 GPU→CPU syncs:
+
+```
+1. _fp16_safe(attn input)   -> h.abs().max().item()   <- probe
+2. _fp16_safe(MLP input)    -> h.abs().max().item()   <- probe
+3. attention fuse           -> isfinite(proj).all()   <- check
+4. MLP fuse                 -> isfinite(out).all()    <- check
+```
+
+Each `.item()`/`.all()` requires the GPU to finish → ship the result to the CPU → Python decides → only then the next kernel is launched. On a 16GB V100 the DiT (21.6GB) is paged from host memory layer by layer, and every sync also stalls the CPU→GPU weight-prefetch pipeline — the GPU idles, so a sync costs more than on a GPU-resident box.
+
+**Why the probes could be dropped outright**: they existed to "downcast to fp16 only when safe", but on a real model (fl2va fp8 + turbo LoRA, 52 layers × 2 inputs) the attention/MLP input peak is only **78.5**, vs the fp16 limit 65504 — an **830× headroom**. All fixed scales since v6.3 have mathematical bounds (qkv/out_proj/fc1/fc2 cannot overflow) and h itself is far inside range, so the probes were pure overhead: the unconditional downcast is bit-identical to the conditional one on real activations.
+
+**Why the fuses were deferred rather than removed**: they are the safety net (extreme outliers beyond the mathematical bounds; the plugin's "never NaN" promise), only the *timing* changed — instead of checking every block, a flag is accumulated on-GPU (`_FUSE_FLAG |= ~isfinite(out).any()`, no `.item()` so no pipeline stall) and checked **once per forward** in a `MiniMaxH3Model.forward` wrapper; on a trip (mathematically impossible) the whole forward re-runs in fp32 as a correctness backstop.
+
+**Measured (local, ref2va fp8, 480p/10s, V100-16GB)**: 75-78 → 71-74 s/step (-4~5s). Plugin overhead over the no-plugin baseline (63s) is now only the fp32 residual stream + refs extra tokens (+8~11s), near the practical floor.
+
 ---
 
 ## 3. The fixed scaling of attention (core math)
@@ -216,6 +233,7 @@ the model is **still forced to fp16 compute, but without the plugin's scaling co
 | v6.5.0 | instance-level patch (no more ghost patching at forward level); drop legacy node ID alias |
 | v6.6.0 | **attention fixed scale 256 → 16** (PR #1, +240× accuracy, still ≥7× overflow headroom); **Issue #2 fixed** (patch runs on a clone; cached ModelPatcher no longer polluted with fp16 compute dtype) |
 | v6.7.0 | **structure-clone isolation (Issue #2, forward side)**: `ModelPatcher.clone()` does not deep-copy the model instance, so forward patches still leaked into cached objects; the module tree is now recursively rebuilt (params shared, instances isolated) so cached objects keep their native forward |
+| v6.8.0 | **zero per-block GPU syncs (deferred fuse)**: drop the 2 magnitude probes (real-model h peak 78.5 << 60000, unconditional downcast ≡ conditional) + accumulate the fuses on-GPU, checked once per forward (a trip re-runs the forward in fp32); 480p/10s measured 75-78 → 71-74 s/step |
 
 ## License
 
