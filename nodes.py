@@ -1,4 +1,4 @@
-# ComfyUI-MiniMaxH3-FP16Safe v6.6.0
+# ComfyUI-MiniMaxH3-FP16Safe v6.7.0
 #
 # Make MiniMax H3 (comfy/ldm/minimax, PR #15224) numerically stable in fp16
 # compute on GPUs without bf16/fp8 hardware (V100 sm_70 etc.), at near-fp16
@@ -21,11 +21,19 @@
 #     seq length (avoids lowvram weight-eviction thrash on 16GB cards)
 #   * video VAE: fp16 stream, only norms/scores/silu upcast to fp32
 #
+# v6.7.0: structure-clone the module tree at patch time. ModelPatcher.clone()
+# only isolates dtype state; the model instance (module tree) is SHARED, so
+# instance-level forward patches would leak into the cached UNETLoader output
+# (deleting the node still leaves the plugin forward active). The clone tree
+# shares weight parameters but has independent module objects, so every patch
+# lands on the clone and cached objects always keep their native forward.
+#
 # Verified magnitudes (real model, extreme timestep):
 #   max|P@V|=706  max|out_proj|~39k  max|fc1|=585  max|silu_act|=59k
 #   max|fc2|=501k  -> every stage is either fp16-safe or 2-power-scaled.
 
 import math
+import copy as _copy
 
 import torch
 import comfy.model_management
@@ -94,6 +102,29 @@ def _wrap_rmsnorms(root):
             setattr(parent, attr, _FP32RMSNorm(mod))
             replaced += 1
     return replaced
+
+
+def _structure_clone(module):
+    """v6.7.0: 递归重建模块树 — 结构与原树完全独立, 但权重参数/缓冲区共享引用。
+
+    ModelPatcher.clone() 只隔离 ModelPatcher 的 dtype 状态 (object_patches /
+    force_cast_weights), model 实例 (模块树) 仍然共享。若直接把 forward patch
+    打在共享模块上, 补丁会残留在 UNETLoader 缓存的原始对象里: 删除本节点重跑
+    时缓存命中, 采样器仍走插件的 fp16 forward -> 与"未删除"行为相同, 只有
+    重新加载模型 (新模块树) 才恢复原生行为。
+
+    本函数逐节点浅拷贝、递归重建 _modules 容器, 得到一棵模块对象独立、参数
+    共享的新树。所有实例级补丁 (forward / RMSNorm 包装 / condition_proj) 只
+    落在这棵克隆树上; 缓存对象始终持有原生 forward。内存增量仅模块对象本身
+    (数百个, 约几 MB), 时间毫秒级; 参数共享保证 ComfyUI 权重 cast 与
+    lowvram 换入换出照常工作。
+    """
+    new = _copy.copy(module)
+    new._modules = dict(module._modules)
+    for name, child in module._modules.items():
+        if child is not None:
+            new._modules[name] = _structure_clone(child)
+    return new
 
 
 def _fp16_safe(h):
@@ -426,6 +457,21 @@ class MiniMaxH3FP16Safe:
                 print("[MiniMaxH3-FP16Safe] WARNING: model.clone() failed (%s); "
                       "patching in place (cache may retain fp16 compute dtype)." % e)
 
+        # ---- v6.7.0 (Issue #2 forward side): 结构克隆模块树 ----
+        # ModelPatcher.clone() 只隔离 dtype 状态, 模块树仍与原对象共享; 直接把
+        # forward patch 打在共享模块上会残留在缓存的 UNETLoader 输出里 (删除
+        # 本节点重跑仍是插件行为)。这里重建一棵结构独立、参数共享的模块树,
+        # 后续所有实例级补丁只落在克隆树上, 缓存对象永远保持原生 forward。
+        inner = getattr(model, "model", None)
+        if inner is not None:
+            try:
+                model.model = _structure_clone(inner)
+                print("[MiniMaxH3-FP16Safe] structure-cloned model tree "
+                      "(params shared, module instances isolated)")
+            except Exception as e:
+                print("[MiniMaxH3-FP16Safe] WARNING: structure clone failed (%s); "
+                      "patching shared tree (cache may retain forward patches)." % e)
+
         # ---- 强制 fp16 计算: MiniMaxH3 官方 supported=[bf16,fp32] 不含 fp16,
         # V100 无 bf16 硬件 -> aki 兜底 cast 成 fp32 (慢 4x, 无 Tensor Core)。
         # 必须在 patch 时强制 fp16, 否则 qkv/out/fc1/fc2 全是 fp32 matmul。
@@ -475,7 +521,7 @@ class MiniMaxH3FP16Safe:
                         break
             except Exception:
                 pass
-            print("[MiniMaxH3-FP16Safe][V6.6-INSTPATCH] DiT patched (instance-level, %d modules): "
+            print("[MiniMaxH3-FP16Safe][V6.7-STRUCTCLONE] DiT patched (instance-level, %d modules): "
                   "fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + "
                   "fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
                   "(profile=%s)" % (patched, n, wrapped_cond, _PROFILE))
