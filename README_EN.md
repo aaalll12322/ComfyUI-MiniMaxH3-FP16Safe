@@ -1,8 +1,10 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**fp16 stability + speed plugin for the MiniMax H3 audio/video DiT (ComfyUI custom node) · v6.5.0**
+**fp16 stability + speed plugin for the MiniMax H3 audio/video DiT (ComfyUI custom node) · v6.6.0**
 
-中文版见 [README.md](README.md) / Chinese version: [README.md](README.md)
+中文版见 [README.md](README.md) / Chinese version: [README.md](README.md) · Development/design notes: [DEVELOPMENT_EN.md](DEVELOPMENT_EN.md) / [DEVELOPMENT.md](DEVELOPMENT.md)
+
+> **AI-assisted development notice**: This project was developed by the author with the help of an AI assistant (DeepSeek-V4-Flash). The author has no computer-science background; code and docs were produced with AI assistance. The project is shared as-is under MIT. If you run into issues, feel free to open an Issue and we will help as far as we can.
 
 Run MiniMax H3 (`comfy/ldm/minimax`, PR #15224) at **near-fp16 speed** with **near-fp32 numerical stability** on **V100 (sm_70, no bf16/fp8 hardware)** or any machine forced into fp16 compute — effectively "emulating bf16's wide exponent range in hardware".
 
@@ -93,7 +95,7 @@ Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned
 
 ```
 [MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6.5-INSTPATCH] DiT patched (instance-level, 251 modules): fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
+[MiniMaxH3-FP16Safe][V6.6-INSTPATCH] DiT patched (instance-level, 251 modules): fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. (profile=False)
 ```
 
 If the DiT line prints "MODEL is not MiniMax H3", the detection did not match — check whether your model is from the MiniMax H3 family.
@@ -106,6 +108,7 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 |---|---|
 | Node missing / `IMPORT FAILED` | Confirm ComfyUI includes PR #15224 (`comfy/ldm/minimax` exists); update ComfyUI and retry |
 | Sampling still NaN | Enable `debug_nan` and share the `[MiniMaxH3-FP16Safe][DEBUG]` output (block index + input/output distinction) |
+| Black frames after removing the node and re-running in the same process (upgraded from v6.5.0 or earlier) | Fixed in v6.6.0 (patch runs on a clone; the cached model no longer retains fp16 compute). If still broken, restart the ComfyUI server to clear the cache |
 | Sampling fine but decode is black | Behavior of pre-v6.4.0 versions; the current node has no VAE port (VAE runs natively). If still black, update ComfyUI and verify the video VAE loads properly |
 | Slower than expected | Enable `profile` and share the `[MiniMaxH3-FP16Safe][PROF]` output (per-stage timings) |
 | Node red/missing (old workflows) | v6.5.0 removed the legacy alias `MiniMaxH3FP16SafeV2`; re-select the node manually in old workflows |
@@ -129,6 +132,7 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 | **v6.3.0** | **Attention fixed /256 scaling, zero scans (q/k restored by RMSNorm, v scaled through linear chain); per-layer syncs 11→2; ref2va fp8 480p/10s measured 75-78s/step** |
 | v6.4.0 | Video VAE back to native fp16 path (fp32 upcast removed): measured finite decode (even with ±38 outliers), ~0.5% output diff vs fp32 path, ~30% faster (14.5s→10.1s) |
 | **v6.5.0** | **Slimmer node + instance-level patching**: removed vae in/out ports and fix_vae (VAE handled natively by ComfyUI); patch now applies only to the current model instance (class methods untouched), deleting the node from a workflow no longer leaves a "ghost" patch active |
+| **v6.6.0** | **Attention fixed scale 256→16 (PR #1, +240× accuracy, still ≥7× overflow headroom) + Issue #2 fix (patch runs on a clone, so removing the node no longer leaves fp16 compute on the cached model)** |
 
 ## License
 

@@ -1,4 +1,4 @@
-# ComfyUI-MiniMaxH3-FP16Safe v6.3.0
+# ComfyUI-MiniMaxH3-FP16Safe v6.6.0
 #
 # Make MiniMax H3 (comfy/ldm/minimax, PR #15224) numerically stable in fp16
 # compute on GPUs without bf16/fp8 hardware (V100 sm_70 etc.), at near-fp16
@@ -155,7 +155,7 @@ def _qkv_scale_check(self, x, x_scale):
     return q, k, v, x_scale
 
 
-# ---- DiT Attention (v6.3): ALWAYS-fp16 SDPA with FIXED power-of-2 scale ----
+# ---- DiT Attention (v6.3+): ALWAYS-fp16 SDPA with FIXED power-of-2 scale ----
 # Zero per-layer scans. x (fp16 or fp32) is always divided by the scale below
 # (an exact power of 2) before qkv_proj, so qkv output is bounded by
 # |x|/s * ||W_qkv||. q/k are restored by RMSNorm homogeneity; v stays scaled
@@ -163,7 +163,7 @@ def _qkv_scale_check(self, x, x_scale):
 #
 # The scale is bounded BELOW by overflow and ABOVE by accuracy:
 #   * overflow: the binding site is out_proj's output, the largest fp16 tensor
-#     in this path (~39k here; 1.43e5 measured at 1344x768/124f). s=16 leaves
+#     in this path (~39k at 480p; 1.43e5 measured at 1344x768/124f). s=16 leaves
 #     ~27x headroom on the former, 7.3x on the latter, with the isfinite fuse
 #     behind it.
 #   * accuracy: RMSNorm is scale-homogeneous only as eps -> 0, because
@@ -171,10 +171,10 @@ def _qkv_scale_check(self, x, x_scale):
 #     makes that term 0.655, which is NOT small next to the live ms(q)
 #     (measured median ~9-10, min ~2.2 at block 0). Attention-output error vs
 #     an unprescaled fp32 reference on identical activations follows 1/s^2
-#     exactly, with no plateau:
-#         /256 cos 0.99973989 (max rel 7.2e-2)   /32 cos 0.99999994 (1.25e-3)
-#         /64  cos 0.99999893 (5.0e-3)           /16 cos 1.00000000 (3.1e-4)
-_ATTN_FIXED_SCALE = 16.0   # 2^4
+#     exactly, with no plateau (verified on real model, 52 layers):
+#         /256 mean rel 1.35e-2        /32  mean rel 2.25e-4
+#         /64  mean rel 8.99e-4        /16  mean rel 5.62e-5  (~240x better)
+_ATTN_FIXED_SCALE = 16.0   # 2^4 (v6.6.0, was 256.0; PR #1)
 
 
 def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
@@ -208,7 +208,7 @@ def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     else:
         q = self.q_norm(q.view(s, self.heads, self.head_dim))
         k = self.k_norm(k.view(s, self.heads, self.head_dim))
-    # [1, heads, s, hd]; q/k restored to O(1) by RMSNorm, v still /256
+    # [1, heads, s, hd]; q/k restored to O(1) by RMSNorm, v still /16
     q = q.transpose(0, 1).unsqueeze(0)
     k = k.transpose(0, 1).unsqueeze(0)
     v = v.transpose(0, 1).unsqueeze(0)
@@ -217,7 +217,7 @@ def _dit_attn_forward(self, x, rope_freqs=None, transformer_options={}):
     else:
         out = torch.nn.functional.scaled_dot_product_attention(q.float(), k.float(), v.float())
     out = out.transpose(1, 2).reshape(s, -1)                              # [s, heads*hd]
-    proj = self.out_proj(out)                                             # fp16, bounded <= ~152
+    proj = self.out_proj(out)                                             # fp16, bounded <= ~2400
     proj = proj.float() * _ATTN_FIXED_SCALE                               # unscale v in fp32
     if not torch.isfinite(proj).all():                                    # insurance (never fires)
         proj = self.out_proj(out.float()).float() * _ATTN_FIXED_SCALE
@@ -409,6 +409,23 @@ class MiniMaxH3FP16Safe:
                   "Update ComfyUI to a build that includes PR #15224." % _IMPORT_ERR)
             return (model,)
 
+        # ---- v6.6.0 (Issue #2 fix): 在 clone 上 patch, 隔离 ModelPatcher 持久状态 ----
+        # set_model_compute_dtype 会把 manual_cast_dtype + force_cast_weights 写入
+        # ModelPatcher.model_options/属性 (持久状态), 而 UNETLoader 输出被 ComfyUI 缓存。
+        # 若直接在缓存对象上修改, 删除本节点后重跑会残留 fp16 compute 却无缩放补偿
+        # (forward patch 是实例级、随新实例消失) -> 回到 NaN/黑帧条件。
+        # clone() 深拷贝 model_options/object_patches, 使缓存中的原始对象保持干净;
+        # 模型实例共享, 但 comfy.ops 的权重自动 cast 保证 fp16 输入下计算正确。
+        if not getattr(model, "_h3fp16safe_patched", False):
+            try:
+                model = model.clone()
+                model._h3fp16safe_patched = True
+                print("[MiniMaxH3-FP16Safe] patching on a cloned ModelPatcher "
+                      "(cache object left untouched, Issue #2)")
+            except Exception as e:
+                print("[MiniMaxH3-FP16Safe] WARNING: model.clone() failed (%s); "
+                      "patching in place (cache may retain fp16 compute dtype)." % e)
+
         # ---- 强制 fp16 计算: MiniMaxH3 官方 supported=[bf16,fp32] 不含 fp16,
         # V100 无 bf16 硬件 -> aki 兜底 cast 成 fp32 (慢 4x, 无 Tensor Core)。
         # 必须在 patch 时强制 fp16, 否则 qkv/out/fc1/fc2 全是 fp32 matmul。
@@ -458,8 +475,8 @@ class MiniMaxH3FP16Safe:
                         break
             except Exception:
                 pass
-            print("[MiniMaxH3-FP16Safe][V6.5-INSTPATCH] DiT patched (instance-level, %d modules): "
-                  "fp32 residual stream + fp16 SDPA attention (fixed /256 scale, zero scans) + "
+            print("[MiniMaxH3-FP16Safe][V6.6-INSTPATCH] DiT patched (instance-level, %d modules): "
+                  "fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + "
                   "fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
                   "(profile=%s)" % (patched, n, wrapped_cond, _PROFILE))
 

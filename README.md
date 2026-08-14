@@ -1,8 +1,10 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.5.0**
+**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.6.0**
 
-> English version: [README_EN.md](README_EN.md)
+> English version: [README_EN.md](README_EN.md) · 开发/设计文档: [DEVELOPMENT.md](DEVELOPMENT.md) / [DEVELOPMENT_EN.md](DEVELOPMENT_EN.md)
+>
+> **AI 辅助开发声明**：本项目由作者借助 AI 助手（DeepSeek-V4-Flash）完成开发，作者本人无计算机专业背景，代码与文档均由 AI 辅助编写。项目按 MIT 协议以现状分享；使用中如有问题，欢迎提 Issue，我们会在能力范围内协助解决。
 
 在 **V100（sm_70，无 bf16/fp8 硬件）** 或任何强制 fp16 计算的机器上，让 MiniMax H3（`comfy/ldm/minimax`，PR #15224）以**接近纯 fp16 的速度**获得**接近 fp32 的数值稳定性**——在硬件上"手动模拟 bf16 的宽指数范围"。
 
@@ -106,6 +108,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 |---|---|
 | 节点找不到 / `IMPORT FAILED` | 确认 ComfyUI 含 PR #15224（`comfy/ldm/minimax` 存在）；升级 ComfyUI 后重试 |
 | 采样仍有 NaN | 打开 `debug_nan`，把 `[MiniMaxH3-FP16Safe][DEBUG]` 输出发来（带 block 索引与输入/输出区分） |
+| 删除节点后同进程重跑黑帧（v6.5.0 及之前升级上来） | v6.6.0 已修复（patch 在 clone 上执行，缓存对象不再残留 fp16 compute）；如仍异常请重启 ComfyUI 服务清缓存 |
 | 采样正常但解码黑 | 属 v6.4.0 之前的旧版行为；当前版本节点无 VAE 端口、VAE 走原生路径，若仍黑请升级 ComfyUI 并确认视频 VAE 加载正常 |
 | 速度慢于预期 | 打开 `profile`，把 `[MiniMaxH3-FP16Safe][PROF]` 输出发来（每阶段耗时定位瓶颈） |
 | 节点显示红色/找不到（旧工作流） | v6.5.0 移除旧 ID `MiniMaxH3FP16SafeV2` 兼容别名，旧工作流需手动重新选择节点 |
@@ -129,6 +132,7 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 | **v6.3.0** | **attention 固定 /256 缩放零扫描（q/k RMSNorm 还原、v 线性链缩放）；每层同步 11→2 次；ref2va fp8 480p/10s 实测 75-78s/步** |
 | v6.4.0 | Video VAE 恢复原生 fp16 路径（去掉 fp32 升精度）：实测 fp16 解码 finite（含 ±38 outlier），与 fp32 路径差异仅 0.5%，解码提速 ~30%（14.5s→10.1s） |
 | **v6.5.0** | **节点精简 + 实例级 patch**：移除 vae 输入/输出端口与 fix_vae（VAE 由 ComfyUI 原生处理）；patch 改为只作用于当前模型实例（类方法不再被改），工作流中删除节点后不再"幽灵生效" |
+| **v6.6.0** | **attention 固定缩放 256→16（PR #1，精度 +240×，溢出余量仍 ≥7×）+ Issue #2 修复（patch 在 clone 上执行，删除节点后缓存对象不再残留 fp16 compute）** |
 
 ## License
 
