@@ -46,6 +46,31 @@ UNET加载器 ──> MiniMax H3 FP16 Safe ──> model ──> 采样器（KSa
 
 ---
 
+## 示例工作流
+
+仓库 [`examples/minimax_h3_r2v_fp16safe.json`](examples/minimax_h3_r2v_fp16safe.json) 提供完整的 **ref2va（参考图生视频）** 示例：基于 ComfyUI 官方 ref2va 模板，插入本插件节点。
+
+```
+UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ──▶ model ──▶ 采样器
+```
+
+**接线要点（重要）**：
+
+- **LoRA 必须接在插件节点之前**：插件 `patch()` 时会克隆模型并重写 forward（v6.6.0/v6.7.0 隔离机制），LoRA 需先合并进模型再交给插件安全化。若接在插件之后，LoRA 会绕过 fp16 安全化范围，并有污染缓存模型的风险。
+- 示例中 LoRA 为 `minimax-h3\minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors`（FL2V turbo 4 步，示例路径），可按需替换或直接删除 `LoraLoader` 节点。
+- 示例参考图 `red_superboy_on_city_roof.png` / `mecha_dragon_lightning.png` 需自行准备（放入 `ComfyUI/input/`）。
+
+**所需模型**：
+
+| 用途 | 文件 |
+|---|---|
+| UNET | `minimax_h3_ref2va_pruned_fp8_scaled.safetensors`（V100 推荐 fp8 版） |
+| 文本编码 | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` |
+| 视频 VAE | `minimax_h3_video_vae_fp16.safetensors` |
+| 音频 VAE | `minimax_h3_audio_vae_fp32.safetensors` |
+
+---
+
 ## 工作原理
 
 思路：**残差流全程 fp32（稳定累加），大矩阵乘保持 fp16（Tensor Core 速度）**。

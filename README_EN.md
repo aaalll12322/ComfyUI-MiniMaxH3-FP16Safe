@@ -46,6 +46,31 @@ UNET Loader ──> MiniMax H3 FP16 Safe ──> model ──> Sampler (KSampler
 
 ---
 
+## Example Workflow
+
+[`examples/minimax_h3_r2v_fp16safe.json`](examples/minimax_h3_r2v_fp16safe.json) in this repo provides a complete **ref2va (reference-image-to-video)** example: the official ComfyUI ref2va template with this plugin's node inserted.
+
+```
+UNET Loader ──▶ LoraLoader (optional) ──▶ MiniMax H3 FP16 Safe ──▶ model ──▶ Sampler
+```
+
+**Wiring notes (important)**:
+
+- **LoRA must be connected *before* the plugin node**: the plugin's `patch()` clones the model and rewrites the forward pass (v6.6.0/v6.7.0 isolation). A LoRA must be merged into the model first, then handed to the plugin for fp16-safing. If placed after the plugin, the LoRA bypasses the fp16-safing scope and risks polluting the cached model object.
+- The example LoRA is `minimax-h3\minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` (FL2V turbo 4-step, sample path) — replace it as needed or just delete the `LoraLoader` node.
+- The sample reference images `red_superboy_on_city_roof.png` / `mecha_dragon_lightning.png` are not bundled; provide your own (put them in `ComfyUI/input/`).
+
+**Required models**:
+
+| Purpose | File |
+|---|---|
+| UNET | `minimax_h3_ref2va_pruned_fp8_scaled.safetensors` (fp8 recommended on V100) |
+| Text encoder | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` |
+| Video VAE | `minimax_h3_video_vae_fp16.safetensors` |
+| Audio VAE | `minimax_h3_audio_vae_fp32.safetensors` |
+
+---
+
 ## How It Works
 
 Idea: **fp32 residual stream (stable accumulation) + fp16 big matmuls (Tensor Core speed)**.
