@@ -54,6 +54,8 @@ V100 (sm_70) has **no bf16 hardware**, so the official path falls back to fp32 (
 
 **Since v6.5.0 the patch is instance-level**: only the modules inside the *current* model instance have their forward replaced; class methods are untouched. After deleting the node from a workflow, other MiniMax models loaded later keep native behavior (no "ghost patching").
 
+**Since v6.7.0 this is backed by a structure clone**: `ModelPatcher.clone()` only isolates dtype state and **does not deep-copy the model instance** — instance-level forward patches written onto the shared modules would still leak into the cached UNETLoader output (deleting the node kept the plugin forward active). The module tree is now recursively rebuilt before patching (weight parameters shared, module instances isolated), so cached objects always keep their native forward (see §6.1).
+
 ---
 
 ## 3. The fixed scaling of attention (core math)
@@ -172,7 +174,7 @@ Beyond numerics, compare real renders (same seed/params, only the scale differs)
 
 ## 6. Known issues and boundaries
 
-### 6.1 [FIXED v6.6.0] Compute dtype persists after node removal (Issue #2)
+### 6.1 [FIXED v6.6.0 + v6.7.0] Patches persist after node removal (Issue #2: dtype side + forward side)
 
 **Symptom (v6.5.0 and earlier)**: `patch()` calls `model.set_model_compute_dtype(torch.float16)`, which writes `manual_cast_dtype` into the ModelPatcher's `object_patches` and sets `force_cast_weights` — this is **persistent state on the ModelPatcher**. ComfyUI caches the UNETLoader output, so:
 
@@ -182,13 +184,19 @@ run once with the node → remove the node → re-run in the same process
 
 the model is **still forced to fp16 compute, but without the plugin's scaling compensation** (the forward patches are instance-level and disappear with newly-loaded model instances) → back to the fp16 NaN/black-frame condition.
 
-**Fix (v6.6.0)**: `patch()` now **`clone()`s the ModelPatcher first and applies everything** (`set_model_compute_dtype` + instance-level forward patches) on the clone, returning it:
+**Fix (v6.6.0, dtype side)**: `patch()` now **`clone()`s the ModelPatcher first and applies everything** (`set_model_compute_dtype` + instance-level forward patches) on the clone, returning it:
 
 - `clone()` deep-copies `model_options` / `object_patches` / `force_cast_weights` → the **cached original ModelPatcher stays clean**, so re-running after removing the node goes back to native fp32 compute;
 - the weight instance is shared (clone does not copy weights), but the forward patches are instance-level and `comfy.ops` auto-casts weights so fp16 inputs compute correctly;
 - verified (`verify_issue2_clone.py`): after patch, the original object's `object_patches` is empty and `force_cast_weights` stays `False`; the fp16 state exists only on the clone.
 
-> If `clone()` fails for external reasons, the plugin falls back to in-place patching and prints a WARNING (the cached object may then retain the fp16 compute dtype; a server restart is advised).
+**Fix (v6.7.0, forward side — the v6.6.0 blind spot)**: `ModelPatcher.clone()` (in `model_patcher.py`) only creates a new ModelPatcher wrapper — **`self.model` (the module tree) is still shared**. So even with dtype state isolated, instance-level patches like `m.forward = MethodType(...)` are still written onto the *shared* module objects — the cached original object (M0) has its module tree modified too. Measured on a real run: after removing both the plugin node and the Model Compute Dtype node, behavior was identical to before removal; only reloading the model (fresh module tree) restored native behavior.
+
+- Solution: `_structure_clone()` **recursively rebuilds the module tree** at patch time — per-node shallow copy with a rebuilt `_modules` container, producing a tree that is **structurally independent with shared weight parameters**; every patch (forward / RMSNorm wrap / condition_proj / debug index) lands only on the clone tree;
+- shared parameters ⇒ ComfyUI weight casting and lowvram load/offload keep working (memory overhead is just the module objects themselves, a few MB; time is milliseconds);
+- verified (`verify_structure_clone.py`, GPU-free small module tree, 5 assertions): structure independent / params shared / forward isolated / structure identical / numerics identical — all pass; a real ComfyUI run shows clean behavior after node removal.
+
+> If `clone()` or the structure clone fails for external reasons, the plugin falls back to in-place patching and prints a WARNING (the cached object may then retain the fp16 compute dtype or the forward patches; a server restart is advised).
 
 ### 6.2 Boundaries
 
@@ -207,6 +215,7 @@ the model is **still forced to fp16 compute, but without the plugin's scaling co
 | v6.4.0 | Video VAE back to native fp16 path (measured finite, no upcast needed) |
 | v6.5.0 | instance-level patch (no more ghost patching at forward level); drop legacy node ID alias |
 | v6.6.0 | **attention fixed scale 256 → 16** (PR #1, +240× accuracy, still ≥7× overflow headroom); **Issue #2 fixed** (patch runs on a clone; cached ModelPatcher no longer polluted with fp16 compute dtype) |
+| v6.7.0 | **structure-clone isolation (Issue #2, forward side)**: `ModelPatcher.clone()` does not deep-copy the model instance, so forward patches still leaked into cached objects; the module tree is now recursively rebuilt (params shared, instances isolated) so cached objects keep their native forward |
 
 ## License
 

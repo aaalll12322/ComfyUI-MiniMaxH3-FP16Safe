@@ -54,6 +54,8 @@ V100（sm_70）**没有 bf16 硬件**，官方路径只能回落 fp32（约慢 4
 
 **v6.5.0 起为实例级 patch**：只替换当前模型实例内模块的 forward，不再修改类方法。工作流中删除节点后，新加载的其他 MiniMax 模型保持原生行为（不"幽灵生效"）。
 
+**v6.7.0 起补上结构克隆**：`ModelPatcher.clone()` 只隔离 dtype 状态、**不深拷贝模型实例**——实例级 forward patch 打在共享模块上，仍会残留在缓存的 UNETLoader 输出里（删节点重跑仍是插件行为）。现在 patch 前先递归重建模块树（权重参数共享、模块实例隔离），缓存对象永远保持原生 forward（见 §6.1）。
+
 ---
 
 ## 3. attention 的固定缩放（核心数学）
@@ -172,7 +174,7 @@ q_s  = rms_norm(q/s) 精确形式    = q / sqrt(ms(q) + eps·s²)
 
 ## 6. 已知问题与边界
 
-### 6.1 [已修复 v6.6.0] 删除节点后 compute dtype 残留（Issue #2）
+### 6.1 [已修复 v6.6.0 + v6.7.0] 删除节点后补丁残留（Issue #2：dtype 侧 + forward 侧）
 
 **现象（v6.5.0 及之前）**：`patch()` 调用 `model.set_model_compute_dtype(torch.float16)`，该调用把 `manual_cast_dtype` 写入 ModelPatcher 的 `object_patches` 并设置 `force_cast_weights`——这是 **ModelPatcher 上的持久状态**。ComfyUI 缓存 UNETLoader 输出，因此：
 
@@ -182,13 +184,19 @@ q_s  = rms_norm(q/s) 精确形式    = q / sqrt(ms(q) + eps·s²)
 
 模型**仍被强制 fp16 compute，但不再有本插件的缩放补偿**（forward patch 是实例级的、随新加载的模型实例消失）→ 回到 fp16 NaN/黑帧的条件。
 
-**修复（v6.6.0）**：`patch()` 现在**先 `model.clone()` 再在其上做全部修改**（`set_model_compute_dtype` + 实例级 forward patch），返回 clone：
+**修复（v6.6.0，dtype 侧）**：`patch()` 现在**先 `model.clone()` 再在其上做全部修改**（`set_model_compute_dtype` + 实例级 forward patch），返回 clone：
 
 - `clone()` 深拷贝 `model_options` / `object_patches` / `force_cast_weights` → **缓存中的原始 ModelPatcher 保持干净**，删除节点后重跑模型回到原生 fp32 compute；
 - 模型权重实例共享（clone 不复制权重），但 forward patch 是实例级、且 `comfy.ops` 的权重自动 cast 保证 fp16 输入下计算正确；
 - 已验证（`verify_issue2_clone.py`）：patch 后原始对象 `object_patches` 为空、`force_cast_weights` 保持 `False`，fp16 状态只存在于 clone 上。
 
-> 若因外部原因 `clone()` 失败，插件会回退为就地 patch 并打印 WARNING（此时缓存对象仍可能保留 fp16 compute dtype，建议重启服务）。
+**修复（v6.7.0，forward 侧——v6.6.0 的盲区）**：`ModelPatcher.clone()`（`model_patcher.py`）只是新建一个 ModelPatcher 包装，**`self.model`（模块树）仍然共享**。因此即便 dtype 状态隔离了，`m.forward = MethodType(...)` 这类实例级补丁仍是直接写在共享模块对象上的——**缓存的原始对象（M0）的模块树也被改掉**。用户实测：删除插件节点 + 模型计算Dtype 节点后重跑，行为与删除前一致，只有重新加载模型（新模块树）才恢复原生。
+
+- 解决：patch 时用 `_structure_clone()` **递归重建模块树**——逐节点浅拷贝、重建 `_modules` 容器，得到一棵**结构独立、权重参数共享**的新树；所有补丁（forward / RMSNorm 包装 / condition_proj / debug 索引）只落在克隆树上；
+- 参数共享 ⇒ ComfyUI 权重 cast 与 lowvram 换入换出照常工作（内存增量仅模块对象本身，约几 MB；耗时毫秒级）；
+- 已验证（`verify_structure_clone.py`，无 GPU 小模块树 5 项断言）：结构独立 / 参数共享 / forward 隔离 / 结构一致 / 数值一致，全过；真实 ComfyUI 上删节点重跑行为干净。
+
+> 若因外部原因 `clone()` 或结构克隆失败，插件会回退为就地 patch 并打印 WARNING（此时缓存对象仍可能保留 fp16 compute dtype 或 forward 补丁，建议重启服务）。
 
 ### 6.2 边界
 
@@ -207,6 +215,7 @@ q_s  = rms_norm(q/s) 精确形式    = q / sqrt(ms(q) + eps·s²)
 | v6.4.0 | 视频 VAE 恢复原生 fp16 路径（实测有限，无需升精度） |
 | v6.5.0 | 实例级 patch（forward 层面不再幽灵生效）；移除旧节点 ID 别名 |
 | v6.6.0 | **attention 固定缩放 256 → 16**（PR #1，精度 +240×，溢出余量仍 ≥7×）；**Issue #2 修复**（patch 在 clone 上执行，缓存对象不再被 dtype 污染） |
+| v6.7.0 | **结构克隆隔离（Issue #2 forward 侧）**：`ModelPatcher.clone()` 不深拷贝模型实例，forward patch 仍会残留进缓存对象；递归重建模块树（参数共享、实例隔离），缓存对象保持原生 forward |
 
 ## License
 
