@@ -116,6 +116,19 @@ UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ─
 
 ---
 
+## 想进一步提速？可以试试 Sol-Attn 稀疏加速插件（尝鲜）
+
+如果你在 V100 上已用本插件跑通 MiniMax H3，还想进一步提速，可以试试配套插件 **[ComfyUI-MiniMaxH3-SolAttn-V100](https://github.com/aaalll12322/ComfyUI-MiniMaxH3-SolAttn-V100)**（Sol-Attn 稀疏，arXiv 2607.24027）：
+
+- **单节点 = 内嵌 FP16Safe（v6.8.0 逻辑）+ Sol-Attn 稀疏**（keep-or-drop kernel），自包含，无需再串联本插件
+- **实测（V100 真机，小规模场景）**：480p/10s 71-74s/步 → **43s/步（约 1.7×）**；960×544/5s 33s → **24s/步（+27%）**，画质肉眼 ≈ dense
+- **稳定性提醒**：稀疏路由对工作流/序列形态敏感，不同分辨率、帧数下效果与画质可能不同，目前仅在小规模真机场景验证过；建议先小分辨率试跑对比画质，确认无损再用于正式出图
+- 推荐配置（开箱即用）：`tau=0.75, end_percent=0.9, dense_blocks="0-1,-1", topk_blocks=32, h3_prefix_tokens=1024`
+
+> 本插件负责"数值正确 + 稳定"，SolAttn 插件在此基础上进一步"跳过无用计算"提速——定位互补，可独立使用。**SolAttn 处于尝鲜阶段，正式出图求稳请继续用本插件（dense 全量计算）。**
+
+---
+
 ## 控制台输出（预期）
 
 ```

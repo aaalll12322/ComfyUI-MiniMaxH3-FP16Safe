@@ -116,6 +116,19 @@ Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned
 
 ---
 
+## Want More Speed? Try the Sol-Attn Sparse Plugin (experimental)
+
+Already running MiniMax H3 with this plugin on V100 and want more speed? You can try the companion plugin **[ComfyUI-MiniMaxH3-SolAttn-V100](https://github.com/aaalll12322/ComfyUI-MiniMaxH3-SolAttn-V100)** (Sol-Attn sparsity, arXiv 2607.24027):
+
+- **One node = embedded FP16Safe (v6.8.0 logic) + Sol-Attn sparsity** (keep-or-drop kernel), self-contained — no need to chain this plugin
+- **Measured on real V100 (small-scale scenes)**: 480p/10s from 71-74 s/step → **43 s/step (~1.7×)**; 960×544/5s 33 s → **24 s/step (+27%)**, quality visually ≈ dense
+- **Stability note**: sparse routing is sensitive to workflow/sequence shape — results and quality may vary across resolutions and frame counts, and it has only been validated on a small set of real runs so far. Try a small resolution first and compare quality before using it for production renders
+- Recommended config (default): `tau=0.75, end_percent=0.9, dense_blocks="0-1,-1", topk_blocks=32, h3_prefix_tokens=1024`
+
+> This plugin makes H3 "numerically correct and stable"; the SolAttn plugin further "skips useless compute" on top of it — complementary, each usable standalone. **SolAttn is experimental; for production renders, stick with this plugin (dense, full compute).**
+
+---
+
 ## Expected Console Output
 
 ```
