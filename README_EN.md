@@ -1,12 +1,11 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**fp16 stability + speed plugin for the MiniMax H3 audio/video DiT (ComfyUI custom node) · v6.8.0**
+**fp16 stability + speed plugin for the MiniMax H3 audio/video/image DiT (ComfyUI custom node) · v6.9.0**
 
 中文版见 [README.md](README.md) / Chinese version: [README.md](README.md) · Development/design notes: [DEVELOPMENT_EN.md](DEVELOPMENT_EN.md) / [DEVELOPMENT.md](DEVELOPMENT.md)
 
-> **AI-assisted development notice**: This project was developed by the author with the help of an AI assistant (DeepSeek-V4-Flash). The author has no computer-science background; code and docs were produced with AI assistance. The project is shared as-is under MIT. If you run into issues, feel free to open an Issue and we will help as far as we can.
 
-Run MiniMax H3 (`comfy/ldm/minimax`, PR #15224) at **near-fp16 speed** with **near-fp32 numerical stability** on **V100 (sm_70, no bf16/fp8 hardware)** or any machine forced into fp16 compute — effectively "emulating bf16's wide exponent range in hardware".
+Run MiniMax H3 (`comfy/ldm/minimax`, PR #15224) — both its **video model** (fl2va / ref2va) and its **image model** (MiniMax-H3-Image) — at **near-fp16 speed** with **near-fp32 numerical stability** on **V100 (sm_70, no bf16/fp8 hardware)** or any machine forced into fp16 compute: effectively "emulating bf16's wide exponent range in hardware".
 
 ---
 
@@ -27,8 +26,6 @@ git clone https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
 ```
 
 Restart ComfyUI. Find the **"MiniMax H3 FP16 Safe"** node under the `MiniMaxH3` category.
-
-> If you previously installed the older `ComfyUI-MiniMaxH3-FP16Fix-v2`: delete the old folder. Workflows saved with the old node ID `MiniMaxH3FP16SafeV2` must re-select this plugin's node before saving.
 
 ---
 
@@ -97,6 +94,8 @@ Idea: **fp32 residual stream (stable accumulation) + fp16 big matmuls (Tensor Co
 
 ## Performance
 
+### Video model
+
 Measured (352×608, 124 frames, 5s video, V100):
 
 | Config | Time per step |
@@ -114,6 +113,20 @@ Long seq (480p/10s, seq ≈ 98.5k, V100, DiT offload environment, real 4-step sa
 
 Verified models: `minimax_h3_fl2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_fp8_scaled`, `minimax_h3_ref2va_pruned_int8_convrot` (all produce valid video; fp8 is ~9s/step faster than int8 on V100 — fp8 recommended).
 
+### Image model
+
+`minimax_h3_image_pruned_int8_convrot`, text-to-image, 1:1 canvas, 1xV100-16GB, plugin enabled, 6 steps:
+
+| Resolution | Time per step |
+|---|---|
+| 1MP | 3.4 s |
+| 2MP | 3.7 s |
+| 4MP | 5.3 s |
+| 8MP | 10.3 s |
+| 16MP | 25 s |
+
+Without the plugin: fp16 compute gives NaN (black frames); fp32 is about 2x slower.
+
 ---
 
 ## Want More Speed? Try the Sol-Attn Sparse Plugin (experimental)
@@ -129,19 +142,6 @@ Already running MiniMax H3 with this plugin on V100 and want more speed? You can
 
 ---
 
-## Expected Console Output
-
-```
-[MiniMaxH3-FP16Safe] patching on a cloned ModelPatcher (cache object left untouched, Issue #2)
-[MiniMaxH3-FP16Safe] structure-cloned model tree (params shared, module instances isolated)
-[MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6.8-NOSYNC] DiT patched (instance-level, 156 modules): fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. zero per-block GPU syncs (deferred fuse, fwd_wrapped=1). (profile=False)
-```
-
-If the DiT line prints "MODEL is not MiniMax H3", the detection did not match — check whether your model is from the MiniMax H3 family.
-
----
-
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -151,7 +151,6 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 | Black frames / unchanged behavior after removing the node and re-running in the same process | v6.6.0 fixed the dtype residue (patch runs on a clone); v6.7.0 fixed the forward residue (structure-cloned module tree at patch time — cached objects keep their native forward, no model reload needed). If still broken, restart the ComfyUI server to clear the cache |
 | Sampling fine but decode is black | Behavior of pre-v6.4.0 versions; the current node has no VAE port (VAE runs natively). If still black, update ComfyUI and verify the video VAE loads properly |
 | Slower than expected | Enable `profile` and share the `[MiniMaxH3-FP16Safe][PROF]` output (per-stage timings) |
-| Node red/missing (old workflows) | v6.5.0 removed the legacy alias `MiniMaxH3FP16SafeV2`; re-select the node manually in old workflows |
 
 ---
 
@@ -159,7 +158,7 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 
 - **ComfyUI**: requires PR #15224 (`comfy/ldm/minimax/` module).
 - **GPU**: any (fp16 overflow is a numerical issue, independent of hardware); most beneficial on V100 (sm_70).
-- **Models**: MiniMax H3 family checkpoints (fp8_scaled / int8_convrot / bf16 all work).
+- **Models**: MiniMax H3 family checkpoints (fp8_scaled / int8_convrot / bf16 all work); MiniMax-H3-Image needs ComfyUI `ede4e5fe8` or newer.
 - **Does not modify any ComfyUI core files** — upgrades do not overwrite it; uninstall = delete the folder.
 
 ---
@@ -175,6 +174,7 @@ If the DiT line prints "MODEL is not MiniMax H3", the detection did not match �
 | **v6.6.0** | **Attention fixed scale 256→16 (PR #1, +240× accuracy, still ≥7× overflow headroom) + Issue #2 fix (patch runs on a clone, so removing the node no longer leaves fp16 compute on the cached model)** |
 | **v6.7.0** | **Structure-clone isolation (Issue #2, forward side)**: the module tree is recursively rebuilt at patch time (weights shared, module instances isolated), so cached objects keep their native forward — no model reload needed after removing the node |
 | **v6.8.0** | **Zero per-block GPU syncs (deferred fuse)**: the 2 magnitude probes are dropped (real-model measurement: attention/MLP input peak 78.5 vs fp16 limit 65504, 830× headroom — unconditional downcast is bit-identical to the conditional one), and the isfinite fuses now accumulate a flag on-GPU and are checked once per forward (a trip re-runs the forward in fp32). ref2va fp8 480p/10s measured 75-78 → 71-74 s/step |
+| **v6.9.0** | **MiniMax-H3-Image support** (ComfyUI `ede4e5fe8` / CORE-708): model detection now walks the MRO, so `MiniMaxH3ImageModel` no longer relies on the structural fallback; the MLP fast path skips chunking when `seq <= 16384`. Measured 1MP / 2MP / 4MP: -13.0% / -17.4% / -21.2% |
 
 ## License
 

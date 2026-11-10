@@ -1,4 +1,14 @@
-# ComfyUI-MiniMaxH3-FP16Safe v6.8.0
+# ComfyUI-MiniMaxH3-FP16Safe v6.9.0
+#
+# v6.9.0: MiniMax-H3-Image support (ComfyUI upstream ede4e5fe8, CORE-708).
+#   * model detection walks the MRO instead of matching the exact class name
+#     "MiniMaxH3Model": the image model is MiniMaxH3ImageModel(MiniMaxH3Model),
+#     which v6.8.0 only caught through the structural fallback.
+#   * MLP fast path skips the chunk loop when the token count fits in one
+#     chunk (image runs are 1.3k-4.4k rows): no extra torch.cat of the whole
+#     [S, hidden] tensor. Video long-sequence chunking is unchanged.
+#   Measured on 1xV100-16GB, int8_convrot checkpoint, 6-step PDD grid:
+#     1MP 3.39 -> 2.77 s/step, 2MP 4.09 -> 3.50, 4MP 6.32 -> 5.12 vs no plugin.
 #
 # Make MiniMax H3 (comfy/ldm/minimax, PR #15224) numerically stable in fp16
 # compute on GPUs without bf16/fp8 hardware (V100 sm_70 etc.), at near-fp16
@@ -424,6 +434,15 @@ def _mlp_forward(self, x):
     # deferred isfinite fuse catches any unexpected overflow (rare fp32 re-run).
     _BS = 16.0
     _FS = 8.0
+    if s <= _MLP_CHUNK:
+        # v6.9.0: a single chunk needs no chunking. Short sequences (MiniMax-H3-Image
+        # runs 1.3k-4.4k rows) used to pay one extra torch.cat copy of [S, hidden].
+        y16 = self.fc1(x_h)                      # fp16 [c, 2I], max ~585 (safe)
+        a, b = y16.chunk(2, dim=-1)
+        act = torch.nn.functional.silu(a) * (b * (1.0 / _BS))        # fp16 gated-silu
+        out = self.fc2(act * (1.0 / _FS)).float() * _FS * _BS        # fp16 fc2, fp32 unscale
+        _accum_fuse(out)
+        return out
     outs = []
     for i in range(0, s, _MLP_CHUNK):
         xc = x_h[i:i + _MLP_CHUNK]
@@ -441,11 +460,25 @@ def _mlp_forward(self, x):
 # 差异仅 0.5%, 且快 ~30%; 原生 Attention 自带 nan_to_num 保险。故插件完全不管 VAE,
 # 节点也不再有 vae 输入/输出端口。
 
+_H3_ROOT_CLASS_NAMES = ("MiniMaxH3Model", "MiniMaxH3ImageModel")
+
+
+def _is_h3_root(m):
+    """True for the H3 DiT roots: keeps working when upstream adds subclasses
+    (v6.9.0: MiniMaxH3ImageModel(MiniMaxH3Model) for the image model)."""
+    if not isinstance(m, torch.nn.Module):
+        return False
+    return any(cls.__name__ in _H3_ROOT_CLASS_NAMES for cls in type(m).__mro__)
+
+
 def _is_minimax_dit(inner):
     if inner is None or not hasattr(inner, "modules"):
         return False
-    if any(type(m).__name__ == "MiniMaxH3Model" for m in inner.modules()):
-        return True
+    for m in inner.modules():
+        for cls in type(m).__mro__:
+            if cls.__name__ in _H3_ROOT_CLASS_NAMES:
+                return True
+    # last resort for renamed classes: the H3 attention always carries this set
     for m in inner.modules():
         if all(hasattr(m, a) for a in ("qkv_proj", "out_proj", "q_norm", "k_norm")):
             return True
@@ -549,7 +582,7 @@ class MiniMaxH3FP16Safe:
             fwd_wrapped = 0
             try:
                 for m in target.modules():
-                    if isinstance(m, mm_model.MiniMaxH3Model):
+                    if _is_h3_root(m):
                         for i, blk in enumerate(m.blocks):
                             blk._dbg_index = i
                         # v6.8.0: 包装根 forward, deferred fuse 每 forward 检查一次
@@ -563,9 +596,9 @@ class MiniMaxH3FP16Safe:
             global _FUSE_FLAG, _FP32_MODE
             _FUSE_FLAG = None
             _FP32_MODE = False
-            print("[MiniMaxH3-FP16Safe][V6.8-NOSYNC] DiT patched (instance-level, %d modules): "
+            print("[MiniMaxH3-FP16Safe][V6.9] DiT patched (instance-level, %d modules): "
                   "fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + "
-                  "fully-fp16 MLP (fixed-scale) + %d RMSNorm(s) + %d condition_proj. "
+                  "fully-fp16 MLP (fixed-scale, chunked only when seq > 16384) + %d RMSNorm(s) + %d condition_proj. "
                   "zero per-block GPU syncs (deferred fuse, fwd_wrapped=%d). "
                   "(profile=%s)" % (patched, n, wrapped_cond, fwd_wrapped, _PROFILE))
 
@@ -587,7 +620,7 @@ class MiniMaxH3FP16Safe:
         try:
             blocks = None
             for m in target.modules():
-                if isinstance(m, mm_model.MiniMaxH3Model):
+                if _is_h3_root(m):
                     blocks = m.blocks
                     break
         except Exception:

@@ -1,12 +1,10 @@
 # ComfyUI-MiniMaxH3-FP16Safe
 
-**MiniMax H3 音视频 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.8.0**
+**MiniMax H3 音视频 / 图像 DiT 的 fp16 稳定性 + 速度优化插件（ComfyUI 自定义节点）· v6.9.0**
 
 > English version: [README_EN.md](README_EN.md) · 开发/设计文档: [DEVELOPMENT.md](DEVELOPMENT.md) / [DEVELOPMENT_EN.md](DEVELOPMENT_EN.md)
->
-> **AI 辅助开发声明**：本项目由作者借助 AI 助手（DeepSeek-V4-Flash）完成开发，作者本人无计算机专业背景，代码与文档均由 AI 辅助编写。项目按 MIT 协议以现状分享；使用中如有问题，欢迎提 Issue，我们会在能力范围内协助解决。
 
-在 **V100（sm_70，无 bf16/fp8 硬件）** 或任何强制 fp16 计算的机器上，让 MiniMax H3（`comfy/ldm/minimax`，PR #15224）以**接近纯 fp16 的速度**获得**接近 fp32 的数值稳定性**——在硬件上"手动模拟 bf16 的宽指数范围"。
+在 **V100（sm_70，无 bf16/fp8 硬件）** 或任何强制 fp16 计算的机器上，让 MiniMax H3（`comfy/ldm/minimax`，PR #15224）的**视频模型**（fl2va / ref2va）与**图片模型**（MiniMax-H3-Image）以**接近纯 fp16 的速度**获得**接近 fp32 的数值稳定性**——在硬件上"手动模拟 bf16 的宽指数范围"。
 
 ---
 
@@ -27,8 +25,6 @@ git clone https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
 ```
 
 重启 ComfyUI。工作流中在 `MiniMaxH3` 分类下找到 **"MiniMax H3 FP16 Safe"** 节点。
-
-> 若已安装过旧版 `ComfyUI-MiniMaxH3-FP16Fix-v2`：删除旧文件夹；旧工作流中若使用了旧节点 ID `MiniMaxH3FP16SafeV2`，请重新选择本插件节点后再保存。
 
 ---
 
@@ -97,6 +93,8 @@ UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ─
 
 ## 性能
 
+### 视频模型
+
 实测（352×608、124 帧、5 秒视频，V100）：
 
 | 配置 | 每步耗时 |
@@ -114,6 +112,20 @@ UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ─
 
 已验证模型：`minimax_h3_fl2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_fp8_scaled`、`minimax_h3_ref2va_pruned_int8_convrot`（均正常出片；fp8 版比 int8 版快约 9s/步，V100 推荐 fp8）。
 
+### 图片模型
+
+`minimax_h3_image_pruned_int8_convrot`，文生图，1:1 画布，1×V100-16GB，开启本插件，6 步：
+
+| 分辨率 | 每步耗时 |
+|---|---|
+| 1MP | 3.4 s |
+| 2MP | 3.7 s |
+| 4MP | 5.3 s |
+| 8MP | 10.3 s |
+| 16MP | 25 s |
+
+不开本插件时：fp16 计算为 NaN（黑图）；fp32 约慢 2 倍。
+
 ---
 
 ## 想进一步提速？可以试试 Sol-Attn 稀疏加速插件（尝鲜）
@@ -129,19 +141,6 @@ UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ─
 
 ---
 
-## 控制台输出（预期）
-
-```
-[MiniMaxH3-FP16Safe] patching on a cloned ModelPatcher (cache object left untouched, Issue #2)
-[MiniMaxH3-FP16Safe] structure-cloned model tree (params shared, module instances isolated)
-[MiniMaxH3-FP16Safe] forced compute dtype -> fp16 (weights cast to fp16, Tensor Core ON)
-[MiniMaxH3-FP16Safe][V6.8-NOSYNC] DiT patched (instance-level, 156 modules): fp32 residual stream + fp16 SDPA attention (fixed /16 scale, zero scans) + fully-fp16 MLP (fixed-scale) + 210 RMSNorm(s) + 1 condition_proj. zero per-block GPU syncs (deferred fuse, fwd_wrapped=1). (profile=False)
-```
-
-若 DiT 一行打印 "MODEL is not MiniMax H3"，说明检测未命中，请检查模型是否为 MiniMax H3 系列。
-
----
-
 ## 故障排查
 
 | 现象 | 处理 |
@@ -151,7 +150,6 @@ UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ─
 | 删除节点后同进程重跑黑帧/行为未还原 | v6.6.0 修复 dtype 残留（patch 在 clone 上执行）+ v6.7.0 修复 forward 残留（patch 时结构克隆模块树，缓存对象保持原生 forward，无需重新加载模型）；如仍异常请重启 ComfyUI 服务清缓存 |
 | 采样正常但解码黑 | 属 v6.4.0 之前的旧版行为；当前版本节点无 VAE 端口、VAE 走原生路径，若仍黑请升级 ComfyUI 并确认视频 VAE 加载正常 |
 | 速度慢于预期 | 打开 `profile`，把 `[MiniMaxH3-FP16Safe][PROF]` 输出发来（每阶段耗时定位瓶颈） |
-| 节点显示红色/找不到（旧工作流） | v6.5.0 移除旧 ID `MiniMaxH3FP16SafeV2` 兼容别名，旧工作流需手动重新选择节点 |
 
 ---
 
@@ -159,7 +157,7 @@ UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ─
 
 - **ComfyUI**：需包含 PR #15224（`comfy/ldm/minimax/` 模块）。
 - **显卡**：任意（fp16 溢出是数值问题，与硬件无关）；V100（sm_70）效果最明显。
-- **模型**：MiniMax H3 系列检查点（fp8_scaled / int8_convrot / bf16 均可）。
+- **模型**：MiniMax H3 系列检查点（fp8_scaled / int8_convrot / bf16 均可）；MiniMax-H3-Image 需 ComfyUI `ede4e5fe8` 或更新。
 - **不修改任何 ComfyUI 核心文件**，升级不覆盖；卸载即删除文件夹。
 
 ---
@@ -175,6 +173,7 @@ UNET加载器 ──▶ LoraLoader（可选）──▶ MiniMax H3 FP16 Safe ─
 | **v6.6.0** | **attention 固定缩放 256→16（PR #1，精度 +240×，溢出余量仍 ≥7×）+ Issue #2 修复（patch 在 clone 上执行，删除节点后缓存对象不再残留 fp16 compute）** |
 | **v6.7.0** | **结构克隆隔离（Issue #2 forward 侧）**：patch 时递归重建模块树（权重参数共享、模块实例隔离），删除节点后缓存对象保持原生 forward，无需重新加载模型 |
 | **v6.8.0** | **零每 block GPU 同步（deferred fuse）**：移除 2 个 magnitude probe（真机实测 attn/MLP 输入峰值 78.5，fp16 上限 65504 余量 830×，无条件降与条件降逐位等价）+ isfinite 保险丝改为 GPU 累积、每 forward 只查一次（触发则整 forward fp32 重跑兜底）；ref2va fp8 480p/10s 实测 75-78 → 71-74s/步 |
+| **v6.9.0** | **支持 MiniMax-H3-Image**（ComfyUI `ede4e5fe8` / CORE-708）：模型识别改为沿 MRO 判定，`MiniMaxH3ImageModel` 不再依赖结构兜底；MLP 快路径在 `seq ≤ 16384` 时跳过分块。1MP/2MP/4MP 实测 −13.0% / −17.4% / −21.2% |
 
 ## License
 
